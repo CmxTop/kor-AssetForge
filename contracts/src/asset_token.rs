@@ -14,6 +14,8 @@ pub enum DataKey {
     ValuationHistory,
     ValuationConfig,
     ValuationTimestamps,
+    DividendSchedule(u64), // asset_id -> schedule
+    LastClaim(u64, Address),
 }
 
 #[derive(Clone)]
@@ -37,6 +39,16 @@ pub struct ValuationConfig {
 pub struct ValuationRecord {
     pub value: i128,
     pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DividendSchedule {
+    pub total_dividend: i128,
+    pub payout_asset: Address,
+    pub next_payout_time: u64,
+    pub interval: u64,
+    pub amount_per_token: i128,
 }
 
 #[contract]
