@@ -656,12 +656,71 @@ mod test {
 
         at_client.update_valuation(&admin, &1000);
         
-        // Advance time
+        at_client.update_valuation(&admin, &1600);
+        assert_eq!(at_client.get_valuation().unwrap().value, 1600);
+    }
+
+    #[test]
+    fn test_dividend_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let payout_asset = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "Token"), &String::from_str(&env, "TKN"), &7);
+
+        // Mint: user1 (600), user2 (400)
+        at_client.mint(&user1, &600, &1, &Address::generate(&env));
+        at_client.mint(&user2, &400, &1, &Address::generate(&env));
+
+        // Schedule: 100M units total. interval 3600
+        at_client.schedule_dividend(&1, &100_000_000, &payout_asset, &3600);
+
+        // Advance time 3601s
         env.ledger().with_mut(|li| {
             li.timestamp += 3601;
         });
+
+        // user1 claims: (600 * 100k) - 2% fee = 60M - 1.2M = 58.8M
+        at_client.claim_dividend(&1, &user1);
+
+        // user2 claims: (400 * 100k) - 2% fee = 40M - 0.8M = 39.2M
+        at_client.claim_dividend(&1, &user2);
+
+        // Attempt to claim again - should fail
+        let res = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+            &at_id,
+            &Symbol::new(&env, "claim_dividend"),
+            (1u64, user1.clone()).into_val(&env),
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "payout not yet due")]
+    fn test_claim_too_early() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let payout_asset = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "Token"), &String::from_str(&env, "TKN"), &7);
+        at_client.mint(&user, &100, &1, &Address::generate(&env));
+
+        at_client.schedule_dividend(&1, &1_000_000, &payout_asset, &3600);
         
-        at_client.update_valuation(&admin, &1100);
-        assert_eq!(at_client.get_valuation().unwrap().value, 1100);
+        // Claim immediately (0s passed)
+        at_client.claim_dividend(&1, &user);
     }
 }
