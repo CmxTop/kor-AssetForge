@@ -1,4 +1,6 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Env, String, Symbol, SymbolShort, Vec, Val, IntoVal,
+};
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
 
@@ -14,6 +16,8 @@ pub enum DataKey {
     ValuationHistory,
     ValuationConfig,
     ValuationTimestamps,
+    DividendSchedule(u64), // asset_id -> schedule
+    LastClaim(u64, Address),
 }
 
 #[derive(Clone)]
@@ -37,6 +41,16 @@ pub struct ValuationConfig {
 pub struct ValuationRecord {
     pub value: i128,
     pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DividendSchedule {
+    pub total_dividend: i128,
+    pub payout_asset: Address,
+    pub next_payout_time: u64,
+    pub interval: u64,
+    pub amount_per_token: i128,
 }
 
 #[contract]
@@ -241,6 +255,95 @@ impl AssetToken {
             (Symbol::new(&env, "valuation_updated"),),
             new_value,
         );
+    }
+
+    pub fn schedule_dividend(
+        env: Env,
+        asset_id: u64,
+        total_dividend: i128,
+        payout_asset: Address,
+        interval: u64,
+    ) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        admin.require_auth();
+
+        if total_dividend <= 0 {
+            panic!("dividend amount must be positive");
+        }
+
+        let total_supply = Self::total_supply(env.clone());
+        if total_supply == 0 {
+            panic!("cannot distribute to zero supply");
+        }
+
+        let now = env.ledger().timestamp();
+        
+        // Calculate amount per token scaled for precision (e.g., 7 decimals)
+        // amount_per_token = (total_dividend * multiplier) / total_supply
+        let amount_per_token = (total_dividend.checked_mul(10_000_000).expect("overflow")) / total_supply;
+
+        let schedule = DividendSchedule {
+            total_dividend,
+            payout_asset,
+            next_payout_time: now + interval,
+            interval,
+            amount_per_token,
+        };
+
+        env.storage().persistent().set(&DataKey::DividendSchedule(asset_id), &schedule);
+
+        env.events().publish(
+            (Symbol::new(&env, "dividend_scheduled"), asset_id),
+            total_dividend,
+        );
+    }
+
+    pub fn claim_dividend(env: Env, asset_id: u64, claimant: Address) {
+        claimant.require_auth();
+
+        let schedule: DividendSchedule = env.storage().persistent()
+            .get(&DataKey::DividendSchedule(asset_id))
+            .expect("no dividend schedule found");
+
+        let now = env.ledger().timestamp();
+        if now < schedule.next_payout_time {
+            panic!("payout not yet due");
+        }
+
+        // Double-claim protection
+        let last_claim_key = DataKey::LastClaim(asset_id, claimant.clone());
+        if let Some(last_claim_time) = env.storage().persistent().get::<_, u64>(&last_claim_key) {
+            if last_claim_time >= schedule.next_payout_time {
+                panic!("already claimed");
+            }
+        }
+
+        let balance = Self::balance(env.clone(), claimant.clone());
+        if balance == 0 {
+            panic!("no tokens held");
+        }
+
+        // Calculate pro-rata amount: (balance * amount_per_token) / multiplier
+        let gross_amount = (balance.checked_mul(schedule.amount_per_token).expect("overflow")) / 10_000_000;
+        
+        // 2% platform fee (stubbed)
+        let fee = gross_amount * 2 / 100;
+        let final_amount = gross_amount - fee;
+
+        // Perform payout (Stubbed for this phase as it requires payout asset contract interaction)
+        // In reality, this would be: token_client.transfer(&env.current_contract_address(), &claimant, &final_amount);
+
+        // Record claim
+        env.storage().persistent().set(&last_claim_key, &now);
+
+        env.events().publish(
+            (Symbol::new(&env, "dividend_claimed"), asset_id, claimant),
+            final_amount,
+        );
+    }
+
+    pub fn get_dividend_info(env: Env, asset_id: u64) -> Option<DividendSchedule> {
+        env.storage().persistent().get(&DataKey::DividendSchedule(asset_id))
     }
 
     /// Get valuation history.
@@ -555,12 +658,71 @@ mod test {
 
         at_client.update_valuation(&admin, &1000);
         
-        // Advance time
+        at_client.update_valuation(&admin, &1600);
+        assert_eq!(at_client.get_valuation().unwrap().value, 1600);
+    }
+
+    #[test]
+    fn test_dividend_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let payout_asset = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "Token"), &String::from_str(&env, "TKN"), &7);
+
+        // Mint: user1 (600), user2 (400)
+        at_client.mint(&user1, &600, &1, &Address::generate(&env));
+        at_client.mint(&user2, &400, &1, &Address::generate(&env));
+
+        // Schedule: 100M units total. interval 3600
+        at_client.schedule_dividend(&1, &100_000_000, &payout_asset, &3600);
+
+        // Advance time 3601s
         env.ledger().with_mut(|li| {
             li.timestamp += 3601;
         });
+
+        // user1 claims: (600 * 100k) - 2% fee = 60M - 1.2M = 58.8M
+        at_client.claim_dividend(&1, &user1);
+
+        // user2 claims: (400 * 100k) - 2% fee = 40M - 0.8M = 39.2M
+        at_client.claim_dividend(&1, &user2);
+
+        // Attempt to claim again - should fail
+        let res = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+            &at_id,
+            &Symbol::new(&env, "claim_dividend"),
+            (1u64, user1.clone()).into_val(&env),
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "payout not yet due")]
+    fn test_claim_too_early() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let payout_asset = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "Token"), &String::from_str(&env, "TKN"), &7);
+        at_client.mint(&user, &100, &1, &Address::generate(&env));
+
+        at_client.schedule_dividend(&1, &1_000_000, &payout_asset, &3600);
         
-        at_client.update_valuation(&admin, &1100);
-        assert_eq!(at_client.get_valuation().unwrap().value, 1100);
+        // Claim immediately (0s passed)
+        at_client.claim_dividend(&1, &user);
     }
 }

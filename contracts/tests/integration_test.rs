@@ -9,9 +9,9 @@ mod tests {
         EmergencyControl, EmergencyControlClient, PauseScope,
     };
     use kor_assetforge_contracts::marketplace::{Marketplace, MarketplaceClient};
-    use kor_assetforge_contracts::asset_token::{AssetToken, AssetTokenClient};
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Address, Env, String};
+    use kor_assetforge_contracts::asset_token::{AssetToken, AssetTokenClient, DividendSchedule};
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{Address, Env, String, IntoVal};
 
     /// Helper: set up the environment with all three contracts deployed.
     fn setup() -> (
@@ -226,5 +226,43 @@ mod tests {
         // Step 4: Admin update should also work
         at_client.update_valuation(&admin, &1600);
         assert_eq!(at_client.get_valuation().unwrap().value, 1600);
+    }
+
+    #[test]
+    fn test_asset_dividend_lifecycle() {
+        let (env, ec_id, _mp_id, at_id, admin) = setup();
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        let payout_asset = Address::generate(&env);
+
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+
+        // 1. Mint tokens: user1 (600), user2 (400)
+        at_client.mint(&user1, &600, &1, &ec_id);
+        at_client.mint(&user2, &400, &1, &ec_id);
+
+        // 2. Schedule dividend: 100M units total
+        at_client.schedule_dividend(&1, &100_000_000, &payout_asset, &3600);
+
+        // 3. Verify schedule info
+        let info = at_client.get_dividend_info(&1).expect("dividend not scheduled");
+        assert_eq!(info.total_dividend, 100_000_000);
+
+        // 4. Advance time
+        env.ledger().with_mut(|li| {
+            li.timestamp += 3601;
+        });
+
+        // 5. Claim dividends
+        at_client.claim_dividend(&1, &user1);
+        at_client.claim_dividend(&1, &user2);
+
+        // 6. Verify double claim fails
+        let res = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+            &at_id,
+            &soroban_sdk::Symbol::new(&env, "claim_dividend"),
+            (1u64, user1).into_val(&env),
+        );
+        assert!(res.is_err());
     }
 }
