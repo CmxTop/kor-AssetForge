@@ -52,7 +52,6 @@ fn pause_flag_key(env: &Env, asset_id: u64, scope: &PauseScope) -> Symbol {
         PauseScope::Trading => 2,
         PauseScope::Minting => 3,
     };
-    // Use a compact key format: "p_{asset_id}_{scope}"
     let mut key_str = [0u8; 32];
     let prefix = b"p_";
     let mut pos = 0;
@@ -62,7 +61,6 @@ fn pause_flag_key(env: &Env, asset_id: u64, scope: &PauseScope) -> Symbol {
             pos += 1;
         }
     }
-    // Encode asset_id as digits
     let id_str = encode_u64(asset_id);
     for &b in id_str.iter() {
         if b == 0 { break; }
@@ -75,7 +73,6 @@ fn pause_flag_key(env: &Env, asset_id: u64, scope: &PauseScope) -> Symbol {
         key_str[pos] = b'_';
         pos += 1;
     }
-    // Encode scope as single digit
     if pos < 32 {
         key_str[pos] = b'0' + scope_idx as u8;
         pos += 1;
@@ -158,7 +155,6 @@ fn encode_u64(mut val: u64) -> [u8; 20] {
         val /= 10;
         pos += 1;
     }
-    // Reverse
     for i in 0..pos {
         buf[i] = tmp[pos - 1 - i];
     }
@@ -423,24 +419,14 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
 
-    fn setup_env() -> (Env, Address, Address) {
+    #[test]
+    fn test_initialize_and_get_admin() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, EmergencyControl);
-        let client_addr = contract_id;
+        let client = EmergencyControlClient::new(&env, &contract_id);
+
         let admin = Address::generate(&env);
-        (env, client_addr, admin)
-    }
-
-    fn create_client(env: &Env, contract_id: &Address) -> EmergencyControlClient {
-        EmergencyControlClient::new(env, contract_id)
-    }
-
-    #[test]
-    fn test_initialize_and_get_admin() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
-
         client.initialize(&admin);
         let stored_admin = client.get_admin();
         assert_eq!(stored_admin, admin);
@@ -449,18 +435,24 @@ mod test {
     #[test]
     #[should_panic(expected = "already initialized")]
     fn test_double_initialize_panics() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
         client.initialize(&admin);
     }
 
     #[test]
     fn test_pause_and_unpause_asset() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -480,9 +472,12 @@ mod test {
 
     #[test]
     fn test_pause_all_blocks_everything() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -499,9 +494,12 @@ mod test {
 
     #[test]
     fn test_pause_history_recorded() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -526,9 +524,12 @@ mod test {
     #[test]
     #[should_panic(expected = "asset is already paused for this scope")]
     fn test_double_pause_panics() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -541,9 +542,12 @@ mod test {
     #[test]
     #[should_panic(expected = "asset is not paused for this scope")]
     fn test_unpause_not_paused_panics() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -553,9 +557,12 @@ mod test {
     #[test]
     #[should_panic(expected = "caller is not admin")]
     fn test_non_admin_pause_panics() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let non_admin = Address::generate(&env);
@@ -568,9 +575,12 @@ mod test {
     #[test]
     #[should_panic(expected = "operation blocked: asset is paused")]
     fn test_require_not_paused_blocks_when_paused() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -582,9 +592,12 @@ mod test {
 
     #[test]
     fn test_require_not_paused_allows_when_not_paused() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -594,9 +607,12 @@ mod test {
 
     #[test]
     fn test_auto_unpause() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -624,9 +640,12 @@ mod test {
 
     #[test]
     fn test_selective_scope_independence() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let asset_id: u64 = 1;
@@ -645,9 +664,12 @@ mod test {
 
     #[test]
     fn test_multiple_assets_independent() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let reason = String::from_str(&env, "asset isolation test");
@@ -664,9 +686,12 @@ mod test {
 
     #[test]
     fn test_empty_pause_history() {
-        let (env, contract_id, admin) = setup_env();
-        let client = create_client(&env, &contract_id);
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EmergencyControl);
+        let client = EmergencyControlClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         client.initialize(&admin);
 
         let history = client.get_pause_history(&1);

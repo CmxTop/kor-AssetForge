@@ -3,6 +3,8 @@
 
 #[cfg(test)]
 mod tests {
+    extern crate kor_assetforge_contracts;
+
     use kor_assetforge_contracts::emergency_control::{
         EmergencyControl, EmergencyControlClient, PauseScope,
     };
