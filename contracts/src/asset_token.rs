@@ -4,11 +4,20 @@ use crate::emergency_control::{EmergencyControl, EmergencyControlClient, PauseSc
 
 #[derive(Clone)]
 #[contracttype]
+pub enum DataKey {
+    Admin,
+    AssetInfo,
+    Balance(Address),
+    TotalSupply,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Asset {
     pub id: u64,
     pub name: String,
     pub symbol: String,
-    pub total_supply: i128,
+    pub decimals: u32,
     pub owner: Address,
 }
 
@@ -23,27 +32,26 @@ impl AssetToken {
         admin: Address,
         name: String,
         symbol: String,
-        total_supply: i128,
-    ) -> u64 {
-        admin.require_auth();
+        decimals: u32,
+    ) {
+        if env.storage().instance().has(&DataKey::AssetInfo) {
+            panic!("already initialized");
+        }
 
-        // Generate asset ID (simplified - use counter in production)
-        let asset_id: u64 = 1;
+        admin.require_auth();
 
         // Store asset metadata
         let asset = Asset {
-            id: asset_id,
+            id: 1, // Simplified for this implementation
             name,
             symbol,
-            total_supply,
+            decimals,
             owner: admin.clone(),
         };
 
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "asset"), &asset);
-
-        asset_id
+        env.storage().instance().set(&DataKey::AssetInfo, &asset);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::TotalSupply, &0i128);
     }
 
     /// Mint new tokens for an asset.
@@ -54,32 +62,42 @@ impl AssetToken {
         amount: i128,
         asset_id: u64,
         emergency_control_id: Address,
-    ) -> bool {
-        to.require_auth();
+    ) {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        // Only admin can mint
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        admin.require_auth();
 
         // Enforce pause check for minting operations
         let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
         ec_client.require_not_paused(&asset_id, &PauseScope::Minting);
 
-        // TODO: Implement minting logic
-        // - Check authorization
-        // - Update balances
-        // - Emit events
+        // Update balance
+        let balance = Self::balance(env.clone(), to.clone());
+        let new_balance = balance.checked_add(amount).expect("balance overflow");
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &new_balance);
 
-        true
-    }
+        // Update total supply
+        let total_supply = Self::total_supply(env.clone());
+        let new_total_supply = total_supply.checked_add(amount).expect("supply overflow");
+        env.storage().instance().set(&DataKey::TotalSupply, &new_total_supply);
 
-    /// Get asset details
-    pub fn get_asset(env: Env) -> Option<Asset> {
-        env.storage()
-            .instance()
-            .get(&Symbol::new(&env, "asset"))
+        // Emit Mint event
+        env.events().publish(
+            (Symbol::new(&env, "mint"), to),
+            amount,
+        );
     }
 
     /// Get balance of an address
     pub fn balance(env: Env, address: Address) -> i128 {
-        // TODO: Implement balance lookup
-        0
+        env.storage()
+            .persistent()
+            .get(&DataKey::Balance(address))
+            .unwrap_or(0)
     }
 
     /// Transfer tokens between addresses.
@@ -91,19 +109,57 @@ impl AssetToken {
         amount: i128,
         asset_id: u64,
         emergency_control_id: Address,
-    ) -> bool {
+    ) {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+        
         from.require_auth();
 
         // Enforce pause check for transfer operations
         let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
         ec_client.require_not_paused(&asset_id, &PauseScope::Transfers);
 
-        // TODO: Implement transfer logic
-        // - Check balance
-        // - Update balances
-        // - Emit events
+        // Check and update sender balance
+        let from_balance = Self::balance(env.clone(), from.clone());
+        if from_balance < amount {
+            panic!("insufficient balance");
+        }
+        let new_from_balance = from_balance - amount;
+        env.storage().persistent().set(&DataKey::Balance(from.clone()), &new_from_balance);
 
-        true
+        // Update recipient balance
+        let to_balance = Self::balance(env.clone(), to.clone());
+        let new_to_balance = to_balance.checked_add(amount).expect("balance overflow");
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &new_to_balance);
+
+        // Emit Transfer event
+        env.events().publish(
+            (Symbol::new(&env, "transfer"), from, to),
+            amount,
+        );
+    }
+
+    pub fn total_supply(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalSupply)
+            .unwrap_or(0)
+    }
+
+    pub fn name(env: Env) -> String {
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("asset not initialized");
+        asset.name
+    }
+
+    pub fn symbol(env: Env) -> String {
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("asset not initialized");
+        asset.symbol
+    }
+
+    pub fn decimals(env: Env) -> u32 {
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("asset not initialized");
+        asset.decimals
     }
 }
 
@@ -123,30 +179,96 @@ mod test {
         let admin = Address::generate(&env);
         let name = String::from_str(&env, "Real Estate Token");
         let symbol = String::from_str(&env, "RET");
-        let supply = 1_000_000;
+        let decimals = 7;
 
-        let asset_id = client.initialize(&admin, &name, &symbol, &supply);
-        assert_eq!(asset_id, 1);
+        client.initialize(&admin, &name, &symbol, &decimals);
+        
+        assert_eq!(client.name(), name);
+        assert_eq!(client.symbol(), symbol);
+        assert_eq!(client.decimals(), decimals);
+        assert_eq!(client.total_supply(), 0);
     }
 
     #[test]
-    fn test_mint_when_not_paused() {
+    #[should_panic(expected = "already initialized")]
+    fn test_initialize_twice_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AssetToken);
+        let client = AssetTokenClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let name = String::from_str(&env, "Token");
+        client.initialize(&admin, &name, &name, &7);
+        client.initialize(&admin, &name, &name, &7);
+    }
+
+    #[test]
+    fn test_mint_success() {
         let env = Env::default();
         env.mock_all_auths();
 
-        // Deploy emergency control contract
         let ec_id = env.register_contract(None, EmergencyControl);
         let ec_client = EmergencyControlClient::new(&env, &ec_id);
         let admin = Address::generate(&env);
         ec_client.initialize(&admin);
 
-        // Deploy asset token contract
         let at_id = env.register_contract(None, AssetToken);
         let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
 
         let to = Address::generate(&env);
-        let result = at_client.mint(&to, &1000, &1, &ec_id);
-        assert!(result);
+        at_client.mint(&to, &1000, &1, &ec_id);
+
+        assert_eq!(at_client.balance(&to), 1000);
+        assert_eq!(at_client.total_supply(), 1000);
+    }
+
+    #[test]
+    fn test_transfer_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let ec_id = env.register_contract(None, EmergencyControl);
+        let ec_client = EmergencyControlClient::new(&env, &ec_id);
+        let admin = Address::generate(&env);
+        ec_client.initialize(&admin);
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        
+        at_client.mint(&user1, &1000, &1, &ec_id);
+        at_client.transfer(&user1, &user2, &400, &1, &ec_id);
+
+        assert_eq!(at_client.balance(&user1), 600);
+        assert_eq!(at_client.balance(&user2), 400);
+        assert_eq!(at_client.total_supply(), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient balance")]
+    fn test_transfer_insufficient_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let ec_id = env.register_contract(None, EmergencyControl);
+        let ec_client = EmergencyControlClient::new(&env, &ec_id);
+        let admin = Address::generate(&env);
+        ec_client.initialize(&admin);
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        
+        at_client.mint(&user1, &100, &1, &ec_id);
+        at_client.transfer(&user1, &user2, &101, &1, &ec_id);
     }
 
     #[test]
@@ -160,11 +282,12 @@ mod test {
         let admin = Address::generate(&env);
         ec_client.initialize(&admin);
 
-        let reason = String::from_str(&env, "minting halt");
-        ec_client.pause_asset(&admin, &1, &PauseScope::Minting, &reason, &0);
-
         let at_id = env.register_contract(None, AssetToken);
         let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let reason = String::from_str(&env, "minting halt");
+        ec_client.pause_asset(&admin, &1, &PauseScope::Minting, &reason, &0);
 
         let to = Address::generate(&env);
         at_client.mint(&to, &1000, &1, &ec_id);
@@ -181,11 +304,12 @@ mod test {
         let admin = Address::generate(&env);
         ec_client.initialize(&admin);
 
-        let reason = String::from_str(&env, "transfer freeze");
-        ec_client.pause_asset(&admin, &1, &PauseScope::Transfers, &reason, &0);
-
         let at_id = env.register_contract(None, AssetToken);
         let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let reason = String::from_str(&env, "transfer freeze");
+        ec_client.pause_asset(&admin, &1, &PauseScope::Transfers, &reason, &0);
 
         let from = Address::generate(&env);
         let to = Address::generate(&env);
@@ -202,17 +326,22 @@ mod test {
         let admin = Address::generate(&env);
         ec_client.initialize(&admin);
 
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let from = Address::generate(&env);
+        let to = Address::generate(&env);
+        
+        // Mint tokens BEFORE pausing
+        at_client.mint(&from, &1000, &1, &ec_id);
+
         // Pause only minting - transfers should still work
         let reason = String::from_str(&env, "minting halt");
         ec_client.pause_asset(&admin, &1, &PauseScope::Minting, &reason, &0);
 
-        let at_id = env.register_contract(None, AssetToken);
-        let at_client = AssetTokenClient::new(&env, &at_id);
-
-        let from = Address::generate(&env);
-        let to = Address::generate(&env);
-        let result = at_client.transfer(&from, &to, &500, &1, &ec_id);
-        assert!(result);
+        at_client.transfer(&from, &to, &500, &1, &ec_id);
+        assert_eq!(at_client.balance(&to), 500);
     }
 
     #[test]
@@ -226,11 +355,12 @@ mod test {
         let admin = Address::generate(&env);
         ec_client.initialize(&admin);
 
-        let reason = String::from_str(&env, "global halt");
-        ec_client.pause_asset(&admin, &1, &PauseScope::All, &reason, &0);
-
         let at_id = env.register_contract(None, AssetToken);
         let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let reason = String::from_str(&env, "global halt");
+        ec_client.pause_asset(&admin, &1, &PauseScope::All, &reason, &0);
 
         let to = Address::generate(&env);
         at_client.mint(&to, &1000, &1, &ec_id);
@@ -247,11 +377,12 @@ mod test {
         let admin = Address::generate(&env);
         ec_client.initialize(&admin);
 
-        let reason = String::from_str(&env, "global halt");
-        ec_client.pause_asset(&admin, &1, &PauseScope::All, &reason, &0);
-
         let at_id = env.register_contract(None, AssetToken);
         let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let reason = String::from_str(&env, "global halt");
+        ec_client.pause_asset(&admin, &1, &PauseScope::All, &reason, &0);
 
         let from = Address::generate(&env);
         let to = Address::generate(&env);

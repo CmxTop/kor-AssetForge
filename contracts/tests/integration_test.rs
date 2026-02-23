@@ -34,6 +34,10 @@ mod tests {
         let ec_client = EmergencyControlClient::new(&env, &ec_id);
         ec_client.initialize(&admin);
 
+        // Initialize asset token
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "Token"), &String::from_str(&env, "TKN"), &7);
+
         (env, ec_id, mp_id, at_id, admin)
     }
 
@@ -82,6 +86,9 @@ mod tests {
         let user = Address::generate(&env);
         let asset_id: u64 = 1;
 
+        // Mint some tokens for transfer test BEFORE pausing
+        at_client.mint(&user, &100, &asset_id, &ec_id);
+
         // Pause only minting
         let reason = String::from_str(&env, "minting freeze");
         ec_client.pause_asset(&admin, &asset_id, &PauseScope::Minting, &reason, &0);
@@ -92,8 +99,7 @@ mod tests {
 
         // Transfers should still work
         let to = Address::generate(&env);
-        let transfer_result = at_client.transfer(&user, &to, &50, &asset_id, &ec_id);
-        assert!(transfer_result);
+        at_client.transfer(&user, &to, &50, &asset_id, &ec_id);
 
         // Minting should be blocked
         let mint_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -118,7 +124,8 @@ mod tests {
         let reason = String::from_str(&env, "full system halt");
         ec_client.pause_asset(&admin, &asset_id, &PauseScope::All, &reason, &0);
 
-        // Trading blocked
+        // Mint some tokens for transfer attempt (this will fail due to pause)
+        // We use catch_unwind for these to verify they are blocked
         let trading_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             mp_client.create_listing(&user, &asset_id, &100, &1000, &ec_id);
         }));
