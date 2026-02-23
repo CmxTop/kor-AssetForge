@@ -1,4 +1,6 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Env, String, Symbol, SymbolShort, Vec, Val, IntoVal,
+};
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
 
@@ -262,14 +264,14 @@ impl AssetToken {
         payout_asset: Address,
         interval: u64,
     ) {
-        let admin = Self::get_admin(env.clone());
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
         admin.require_auth();
 
         if total_dividend <= 0 {
             panic!("dividend amount must be positive");
         }
 
-        let total_supply = Self::total_supply(env.clone(), asset_id);
+        let total_supply = Self::total_supply(env.clone());
         if total_supply == 0 {
             panic!("cannot distribute to zero supply");
         }
