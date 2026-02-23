@@ -255,6 +255,95 @@ impl AssetToken {
         );
     }
 
+    pub fn schedule_dividend(
+        env: Env,
+        asset_id: u64,
+        total_dividend: i128,
+        payout_asset: Address,
+        interval: u64,
+    ) {
+        let admin = Self::get_admin(env.clone());
+        admin.require_auth();
+
+        if total_dividend <= 0 {
+            panic!("dividend amount must be positive");
+        }
+
+        let total_supply = Self::total_supply(env.clone(), asset_id);
+        if total_supply == 0 {
+            panic!("cannot distribute to zero supply");
+        }
+
+        let now = env.ledger().timestamp();
+        
+        // Calculate amount per token scaled for precision (e.g., 7 decimals)
+        // amount_per_token = (total_dividend * multiplier) / total_supply
+        let amount_per_token = (total_dividend.checked_mul(10_000_000).expect("overflow")) / total_supply;
+
+        let schedule = DividendSchedule {
+            total_dividend,
+            payout_asset,
+            next_payout_time: now + interval,
+            interval,
+            amount_per_token,
+        };
+
+        env.storage().persistent().set(&DataKey::DividendSchedule(asset_id), &schedule);
+
+        env.events().publish(
+            (Symbol::new(&env, "dividend_scheduled"), asset_id),
+            total_dividend,
+        );
+    }
+
+    pub fn claim_dividend(env: Env, asset_id: u64, claimant: Address) {
+        claimant.require_auth();
+
+        let schedule: DividendSchedule = env.storage().persistent()
+            .get(&DataKey::DividendSchedule(asset_id))
+            .expect("no dividend schedule found");
+
+        let now = env.ledger().timestamp();
+        if now < schedule.next_payout_time {
+            panic!("payout not yet due");
+        }
+
+        // Double-claim protection
+        let last_claim_key = DataKey::LastClaim(asset_id, claimant.clone());
+        if let Some(last_claim_time) = env.storage().persistent().get::<_, u64>(&last_claim_key) {
+            if last_claim_time >= schedule.next_payout_time {
+                panic!("already claimed");
+            }
+        }
+
+        let balance = Self::balance(env.clone(), claimant.clone());
+        if balance == 0 {
+            panic!("no tokens held");
+        }
+
+        // Calculate pro-rata amount: (balance * amount_per_token) / multiplier
+        let gross_amount = (balance.checked_mul(schedule.amount_per_token).expect("overflow")) / 10_000_000;
+        
+        // 2% platform fee (stubbed)
+        let fee = gross_amount * 2 / 100;
+        let final_amount = gross_amount - fee;
+
+        // Perform payout (Stubbed for this phase as it requires payout asset contract interaction)
+        // In reality, this would be: token_client.transfer(&env.current_contract_address(), &claimant, &final_amount);
+
+        // Record claim
+        env.storage().persistent().set(&last_claim_key, &now);
+
+        env.events().publish(
+            (Symbol::new(&env, "dividend_claimed"), asset_id, claimant),
+            final_amount,
+        );
+    }
+
+    pub fn get_dividend_info(env: Env, asset_id: u64) -> Option<DividendSchedule> {
+        env.storage().persistent().get(&DataKey::DividendSchedule(asset_id))
+    }
+
     /// Get valuation history.
     pub fn get_valuation_history(env: Env) -> soroban_sdk::Vec<ValuationRecord> {
         env.storage().persistent().get(&DataKey::ValuationHistory).unwrap_or(soroban_sdk::Vec::new(&env))
