@@ -203,4 +203,28 @@ mod tests {
         }));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_valuation_management() {
+        let (env, _ec_id, _mp_id, at_id, admin) = setup();
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        let oracle = Address::generate(&env);
+
+        // Step 1: Set oracle
+        at_client.set_oracle(&oracle);
+
+        // Step 2: Update valuation via oracle
+        at_client.update_valuation(&oracle, &1500);
+        let val = at_client.get_valuation().unwrap();
+        assert_eq!(val.value, 1500);
+
+        // Step 3: Verify history
+        let history = at_client.get_valuation_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().value, 1500);
+
+        // Step 4: Admin update should also work
+        at_client.update_valuation(&admin, &1600);
+        assert_eq!(at_client.get_valuation().unwrap().value, 1600);
+    }
 }

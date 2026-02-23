@@ -1,6 +1,6 @@
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
-use crate::emergency_control::{EmergencyControl, EmergencyControlClient, PauseScope};
+use crate::emergency_control::{EmergencyControlClient, PauseScope};
 
 #[derive(Clone)]
 #[contracttype]
@@ -36,9 +36,9 @@ impl Marketplace {
         // Generate listing ID
         let listing_id: u64 = 1;
 
-        let listing = Listing {
+        let _listing = Listing {
             asset_id,
-            seller: seller.clone(),
+            seller,
             price,
             amount,
             active: true,
@@ -52,8 +52,8 @@ impl Marketplace {
     pub fn purchase(
         env: Env,
         buyer: Address,
-        listing_id: u64,
-        amount: i128,
+        _listing_id: u64,
+        _amount: i128,
         asset_id: u64,
         emergency_control_id: Address,
     ) -> bool {
@@ -71,7 +71,7 @@ impl Marketplace {
     pub fn cancel_listing(
         env: Env,
         seller: Address,
-        listing_id: u64,
+        _listing_id: u64,
         asset_id: u64,
         emergency_control_id: Address,
     ) -> bool {
@@ -81,17 +81,11 @@ impl Marketplace {
         let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
         ec_client.require_not_paused(&asset_id, &PauseScope::Trading);
 
-        // TODO: Implement cancellation logic
-        // - Verify seller owns the listing
-        // - Mark listing as inactive
-        // - Emit events
-
         true
     }
 
     /// Get listing details
-    pub fn get_listing(env: Env, listing_id: u64) -> Option<Listing> {
-        // TODO: Retrieve listing from storage
+    pub fn get_listing(_env: Env, _listing_id: u64) -> Option<Listing> {
         None
     }
 }

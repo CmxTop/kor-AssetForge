@@ -1,6 +1,6 @@
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
 
-use crate::emergency_control::{EmergencyControl, EmergencyControlClient, PauseScope};
+use crate::emergency_control::{EmergencyControlClient, PauseScope};
 
 #[derive(Clone)]
 #[contracttype]
@@ -9,6 +9,11 @@ pub enum DataKey {
     AssetInfo,
     Balance(Address),
     TotalSupply,
+    Oracle,
+    Valuation,
+    ValuationHistory,
+    ValuationConfig,
+    ValuationTimestamps,
 }
 
 #[derive(Clone)]
@@ -19,6 +24,19 @@ pub struct Asset {
     pub symbol: String,
     pub decimals: u32,
     pub owner: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ValuationConfig {
+    pub min_interval: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ValuationRecord {
+    pub value: i128,
+    pub timestamp: u64,
 }
 
 #[contract]
@@ -161,13 +179,81 @@ impl AssetToken {
         let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("asset not initialized");
         asset.decimals
     }
+
+    /// Set the trusted oracle address. (Admin only)
+    pub fn set_oracle(env: Env, oracle: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+    }
+
+    /// Set the minimum time interval between updates. (Admin only)
+    pub fn set_valuation_config(env: Env, min_interval: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        admin.require_auth();
+        let config = ValuationConfig { min_interval };
+        env.storage().instance().set(&DataKey::ValuationConfig, &config);
+    }
+
+    /// Get current valuation and timestamp.
+    pub fn get_valuation(env: Env) -> Option<ValuationRecord> {
+        env.storage().instance().get(&DataKey::Valuation)
+    }
+
+    /// Update the asset valuation. (Admin or Oracle only)
+    pub fn update_valuation(env: Env, updater: Address, new_value: i128) {
+        updater.require_auth();
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        let oracle: Option<Address> = env.storage().instance().get(&DataKey::Oracle);
+        
+        let is_admin = updater == admin;
+        let is_oracle = if let Some(o) = oracle { updater == o } else { false };
+        
+        if !is_admin && !is_oracle {
+            panic!("not authorized");
+        }
+
+        // Enforce interval
+        let now = env.ledger().timestamp();
+        let config: ValuationConfig = env.storage().instance()
+            .get(&DataKey::ValuationConfig)
+            .unwrap_or(ValuationConfig { min_interval: 0 });
+            
+        if let Some(last) = env.storage().instance().get::<_, ValuationRecord>(&DataKey::Valuation) {
+            if now < last.timestamp + config.min_interval {
+                panic!("too frequent update");
+            }
+        }
+
+        let record = ValuationRecord { value: new_value, timestamp: now };
+        env.storage().instance().set(&DataKey::Valuation, &record);
+
+        // Store in history
+        let mut history: soroban_sdk::Vec<ValuationRecord> = env.storage().persistent()
+            .get(&DataKey::ValuationHistory)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        history.push_back(record.clone());
+        env.storage().persistent().set(&DataKey::ValuationHistory, &history);
+
+        // Emit valuation event
+        env.events().publish(
+            (Symbol::new(&env, "valuation_updated"),),
+            new_value,
+        );
+    }
+
+    /// Get valuation history.
+    pub fn get_valuation_history(env: Env) -> soroban_sdk::Vec<ValuationRecord> {
+        env.storage().persistent().get(&DataKey::ValuationHistory).unwrap_or(soroban_sdk::Vec::new(&env))
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::emergency_control::EmergencyControl;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[test]
     fn test_initialize() {
@@ -387,5 +473,94 @@ mod test {
         let from = Address::generate(&env);
         let to = Address::generate(&env);
         at_client.transfer(&from, &to, &500, &1, &ec_id);
+    }
+
+    #[test]
+    fn test_valuation_flow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+        
+        // Set oracle
+        at_client.set_oracle(&oracle);
+        
+        // Admin update
+        at_client.update_valuation(&admin, &1000);
+        let val = at_client.get_valuation().unwrap();
+        assert_eq!(val.value, 1000);
+        
+        // Oracle update
+        at_client.update_valuation(&oracle, &1100);
+        let val = at_client.get_valuation().unwrap();
+        assert_eq!(val.value, 1100);
+        
+        // Check history
+        let history = at_client.get_valuation_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().value, 1000);
+        assert_eq!(history.get(1).unwrap().value, 1100);
+    }
+
+    #[test]
+    #[should_panic(expected = "not authorized")]
+    fn test_valuation_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+        let intruder = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+        at_client.update_valuation(&intruder, &1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "too frequent update")]
+    fn test_valuation_interval_enforcement() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+        at_client.set_valuation_config(&3600); // 1 hour
+
+        at_client.update_valuation(&admin, &1000);
+        
+        // Immediate update should fail
+        at_client.update_valuation(&admin, &1100);
+    }
+
+    #[test]
+    fn test_valuation_interval_success_after_wait() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+        at_client.set_valuation_config(&3600); // 1 hour
+
+        at_client.update_valuation(&admin, &1000);
+        
+        // Advance time
+        env.ledger().with_mut(|li| {
+            li.timestamp += 3601;
+        });
+        
+        at_client.update_valuation(&admin, &1100);
+        assert_eq!(at_client.get_valuation().unwrap().value, 1100);
     }
 }
