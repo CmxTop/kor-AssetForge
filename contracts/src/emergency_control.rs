@@ -63,7 +63,9 @@ fn pause_flag_key(env: &Env, asset_id: u64, scope: &PauseScope) -> Symbol {
     }
     let id_str = encode_u64(asset_id);
     for &b in id_str.iter() {
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         if pos < 32 {
             key_str[pos] = b;
             pos += 1;
@@ -100,7 +102,9 @@ fn auto_unpause_key(env: &Env, asset_id: u64, scope: &PauseScope) -> Symbol {
     }
     let id_str = encode_u64(asset_id);
     for &b in id_str.iter() {
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         if pos < 32 {
             key_str[pos] = b;
             pos += 1;
@@ -131,7 +135,9 @@ fn history_key(env: &Env, asset_id: u64) -> Symbol {
     }
     let id_str = encode_u64(asset_id);
     for &b in id_str.iter() {
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         if pos < 32 {
             key_str[pos] = b;
             pos += 1;
