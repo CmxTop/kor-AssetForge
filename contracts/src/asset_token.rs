@@ -1,5 +1,5 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String, Symbol, SymbolShort, Vec, Val, IntoVal,
+    contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec, Val, IntoVal,
 };
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
