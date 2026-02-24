@@ -1,9 +1,10 @@
 {
   "generators": {
-    "address": 2,
+    "address": 3,
     "nonce": 0
   },
   "auth": [
+    [],
     [],
     []
   ],
@@ -59,7 +60,7 @@
                                 "symbol": "is_fractionalized"
                               },
                               "val": {
-                                "bool": false
+                                "bool": true
                               }
                             },
                             {
@@ -91,7 +92,7 @@
                                 "symbol": "total_fractions"
                               },
                               "val": {
-                                "u64": 0
+                                "u64": 1000
                               }
                             },
                             {
@@ -112,7 +113,27 @@
                               "val": {
                                 "i128": {
                                   "hi": 0,
-                                  "lo": 0
+                                  "lo": 100
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "symbol": "balances"
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              },
+                              "val": {
+                                "i128": {
+                                  "hi": 0,
+                                  "lo": 100000
                                 }
                               }
                             }
@@ -233,10 +254,95 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
               },
               {
-                "symbol": "get_asset"
+                "symbol": "mint_fractional"
               }
             ],
-            "data": "void"
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 100000
+                  }
+                },
+                {
+                  "u64": 1000
+                },
+                {
+                  "vec": [
+                    {
+                      "vec": [
+                        {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                        },
+                        {
+                          "u64": 1000
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fractions_minted"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "asset_id"
+                  },
+                  "val": {
+                    "u64": 1
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "issuer"
+                  },
+                  "val": {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "total_fractions"
+                  },
+                  "val": {
+                    "u64": 1000
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "unit_value"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 100
+                    }
+                  }
+                }
+              ]
+            }
           }
         }
       },
@@ -254,82 +360,63 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "get_asset"
+                "symbol": "mint_fractional"
               }
             ],
             "data": {
-              "map": [
-                {
-                  "key": {
-                    "symbol": "id"
-                  },
-                  "val": {
-                    "u64": 1
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "is_fractionalized"
-                  },
-                  "val": {
-                    "bool": false
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "name"
-                  },
-                  "val": {
-                    "string": "Real Estate Token"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "owner"
-                  },
-                  "val": {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "symbol"
-                  },
-                  "val": {
-                    "string": "RET"
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "total_fractions"
-                  },
-                  "val": {
-                    "u64": 0
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "total_supply"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 1000000
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "unit_value"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 0
-                    }
-                  }
-                }
-              ]
+              "u64": 1
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000001"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 100000
+              }
             }
           }
         }
