@@ -1,4 +1,5 @@
 // Integration tests for kor-AssetForge smart contracts
+// Tests cross-contract interactions between EmergencyControl, Marketplace, AssetToken, and Governance
 
 #[cfg(test)]
 mod tests {
@@ -7,8 +8,64 @@ mod tests {
     // UNIT TESTS: Asset Initialization
 
     #[test]
-    fn test_placeholder() {
-        assert!(true);
+    fn test_governance_and_pause_combined() {
+        let (env, ec_id, mp_id, at_id, gov_id, admin) = setup();
+        let ec_client = EmergencyControlClient::new(&env, &ec_id);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        let gov_client = GovernanceClient::new(&env, &gov_id);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let asset_id: u64 = 30;
+
+        at_client.mint(&proposer, &200, &1, &ec_id);
+        at_client.mint(&voter, &150, &1, &ec_id);
+
+        // Pass proposal
+        let pid = gov_client.create_proposal(
+            &proposer,
+            &asset_id,
+            &String::from_str(&env, "Approved asset"),
+            &3600,
+        );
+        gov_client.vote(&voter, &pid, &true);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 3601;
+        });
+        gov_client.tally_execute(&pid);
+        assert!(gov_client.is_approved(&asset_id));
+
+        // Pause trading on the asset
+        let reason = String::from_str(&env, "maintenance");
+        ec_client.pause_asset(&admin, &asset_id, &PauseScope::Trading, &reason, &0);
+
+        // Even though governance approved, pause should block listing
+        let seller = Address::generate(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mp_client.create_listing(
+                &seller,
+                &asset_id,
+                &50,
+                &1000,
+                &ec_id,
+                &Some(gov_id.clone()),
+            );
+        }));
+        assert!(result.is_err());
+
+        // Unpause — listing should work
+        ec_client.unpause_asset(&admin, &asset_id, &PauseScope::Trading);
+        let lid = mp_client.create_listing(
+            &seller,
+            &asset_id,
+            &50,
+            &1000,
+            &ec_id,
+            &Some(gov_id),
+        );
+        assert_eq!(lid, 1);
     }
 
     #[test]

@@ -46,12 +46,35 @@ pub struct Asset {
     pub id: u64,
     pub name: String,
     pub symbol: String,
-    pub total_supply: i128,
+    pub decimals: u32,
     pub owner: Address,
     // Fractional minting fields
     pub is_fractionalized: bool,
     pub total_fractions: u64,
     pub unit_value: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ValuationConfig {
+    pub min_interval: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ValuationRecord {
+    pub value: i128,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DividendSchedule {
+    pub total_dividend: i128,
+    pub payout_asset: Address,
+    pub next_payout_time: u64,
+    pub interval: u64,
+    pub amount_per_token: i128,
 }
 
 #[contract]
@@ -75,20 +98,15 @@ impl AssetToken {
         
         // Store asset metadata
         let asset = Asset {
-            id: asset_id,
+            id: 1, // Simplified for this implementation
             name,
             symbol,
-            total_supply,
+            decimals,
             owner: admin.clone(),
             is_fractionalized: false,
             total_fractions: 0,
             unit_value: 0,
         };
-        
-        env.storage().instance().set(&Symbol::new(&env, "asset"), &asset);
-        
-        asset_id
-    }
 
     /// Mint fractional tokens for an asset
     /// 
@@ -207,9 +225,42 @@ impl AssetToken {
         true
     }
 
-    /// Get asset details
-    pub fn get_asset(env: Env) -> Option<Asset> {
-        env.storage().instance().get(&Symbol::new(&env, "asset"))
+    /// Mint new tokens for an asset.
+    /// Blocked if the asset is paused for Minting scope.
+    pub fn mint(
+        env: Env,
+        to: Address,
+        amount: i128,
+        asset_id: u64,
+        emergency_control_id: Address,
+    ) {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        // Only admin can mint
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        admin.require_auth();
+
+        // Enforce pause check for minting operations
+        let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
+        ec_client.require_not_paused(&asset_id, &PauseScope::Minting);
+
+        // Update balance
+        let balance = Self::balance(env.clone(), to.clone());
+        let new_balance = balance.checked_add(amount).expect("balance overflow");
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &new_balance);
+
+        // Update total supply
+        let total_supply = Self::total_supply(env.clone());
+        let new_total_supply = total_supply.checked_add(amount).expect("supply overflow");
+        env.storage().instance().set(&DataKey::TotalSupply, &new_total_supply);
+
+        // Emit Mint event
+        env.events().publish(
+            (Symbol::new(&env, "mint"), to),
+            amount,
+        );
     }
 
     /// Get balance of an address 
@@ -280,18 +331,83 @@ impl AssetToken {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use crate::emergency_control::EmergencyControl;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[test]
     fn test_initialize() {
         let env = Env::default();
+        env.mock_all_auths();
         let contract_id = env.register_contract(None, AssetToken);
         let client = AssetTokenClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
         let name = String::from_str(&env, "Real Estate Token");
         let symbol = String::from_str(&env, "RET");
-        let supply = 1_000_000;
+        let decimals = 7;
+
+        client.initialize(&admin, &name, &symbol, &decimals);
+        
+        assert_eq!(client.name(), name);
+        assert_eq!(client.symbol(), symbol);
+        assert_eq!(client.decimals(), decimals);
+        assert_eq!(client.total_supply(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_initialize_twice_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AssetToken);
+        let client = AssetTokenClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let name = String::from_str(&env, "Token");
+        client.initialize(&admin, &name, &name, &7);
+        client.initialize(&admin, &name, &name, &7);
+    }
+
+    #[test]
+    fn test_mint_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let ec_id = env.register_contract(None, EmergencyControl);
+        let ec_client = EmergencyControlClient::new(&env, &ec_id);
+        let admin = Address::generate(&env);
+        ec_client.initialize(&admin);
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let to = Address::generate(&env);
+        at_client.mint(&to, &1000, &1, &ec_id);
+
+        assert_eq!(at_client.balance(&to), 1000);
+        assert_eq!(at_client.total_supply(), 1000);
+    }
+
+    #[test]
+    fn test_transfer_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let ec_id = env.register_contract(None, EmergencyControl);
+        let ec_client = EmergencyControlClient::new(&env, &ec_id);
+        let admin = Address::generate(&env);
+        ec_client.initialize(&admin);
+
+        let at_id = env.register_contract(None, AssetToken);
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        
+        at_client.mint(&user1, &1000, &1, &ec_id);
+        at_client.transfer(&user1, &user2, &400, &1, &ec_id);
 
         let asset_id = client.initialize(&admin, &name, &symbol, &supply);
         assert_eq!(asset_id, 1);
