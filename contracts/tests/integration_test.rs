@@ -6,6 +6,57 @@ mod tests {
     // use soroban_sdk::{Address, Env, String, Symbol};
 
     // UNIT TESTS: Asset Initialization
+    extern crate kor_assetforge_contracts;
+
+    use kor_assetforge_contracts::asset_token::{
+        AssetToken, AssetTokenClient, BridgeStatus, TargetChain,
+    };
+    use kor_assetforge_contracts::emergency_control::{
+        EmergencyControl, EmergencyControlClient, PauseScope,
+    };
+    use kor_assetforge_contracts::governance::{Governance, GovernanceClient, ProposalStatus};
+    use kor_assetforge_contracts::marketplace::{Marketplace, MarketplaceClient};
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{Address, Bytes, BytesN, Env, IntoVal, String};
+
+    /// Helper: set up the environment with all contracts deployed.
+    fn setup() -> (
+        Env,
+        Address, // ec_id
+        Address, // mp_id
+        Address, // at_id
+        Address, // gov_id
+        Address, // admin
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let ec_id = env.register_contract(None, EmergencyControl);
+        let mp_id = env.register_contract(None, Marketplace);
+        let at_id = env.register_contract(None, AssetToken);
+        let gov_id = env.register_contract(None, Governance);
+
+        let admin = Address::generate(&env);
+
+        // Initialize emergency control
+        let ec_client = EmergencyControlClient::new(&env, &ec_id);
+        ec_client.initialize(&admin);
+
+        // Initialize asset token
+        let at_client = AssetTokenClient::new(&env, &at_id);
+        at_client.initialize(
+            &admin,
+            &String::from_str(&env, "Token"),
+            &String::from_str(&env, "TKN"),
+            &7,
+        );
+
+        // Initialize governance: quorum=100, deposit=50
+        let gov_client = GovernanceClient::new(&env, &gov_id);
+        gov_client.initialize(&admin, &at_id, &100, &50);
+
+        (env, ec_id, mp_id, at_id, gov_id, admin)
+    }
 
     #[test]
     fn test_governance_and_pause_combined() {
@@ -247,6 +298,11 @@ mod tests {
         // Implement: Call transfer with unauthorized signer => Should fail
         assert!(true);
     }
+        // 3. Verify schedule info
+        let info = at_client
+            .get_dividend_info(&1)
+            .expect("dividend not scheduled");
+        assert_eq!(info.total_dividend, 100_000_000);
 
     #[test]
     fn test_fractional_transfer_insufficient_balance() {
@@ -279,6 +335,146 @@ mod tests {
     }
 
     // INTEGRATION TESTS: Multi-Owner Scenarios
+    // =========================================================================
+    // Cross-Chain Bridging Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_full_bridge_out_in_lifecycle() {
+        let (env, ec_id, _mp_id, at_id, _gov_id, _admin) = setup();
+        let at_client = AssetTokenClient::new(&env, &at_id);
+
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let pubkey = BytesN::from_array(&env, &[1u8; 32]);
+
+        // Mint tokens and configure bridge (0 fee for clarity)
+        at_client.mint(&user, &50_000, &1, &ec_id);
+        at_client.set_bridge_config(&0, &pool, &3600, &10, &pubkey);
+
+        let asset_id = Address::generate(&env);
+        let target_addr = Bytes::from_array(&env, &[0xABu8; 20]);
+
+        // Bridge out 20,000 tokens
+        let bridge_id = at_client.bridge_out(
+            &user,
+            &asset_id,
+            &20_000,
+            &TargetChain::Ethereum,
+            &target_addr,
+        );
+        assert_eq!(at_client.balance(&user), 30_000);
+        assert_eq!(at_client.total_supply(), 30_000);
+
+        // Verify pending bridge
+        let pending = at_client.get_pending_bridge(&bridge_id).unwrap();
+        assert_eq!(pending.status, BridgeStatus::Pending);
+        assert_eq!(pending.amount, 20_000);
+
+        // Bridge in to recipient on Stellar (admin auth mocked)
+        at_client.bridge_in(
+            &bridge_id,
+            &recipient,
+            &asset_id,
+            &20_000,
+            &TargetChain::Ethereum,
+        );
+
+        assert_eq!(at_client.balance(&recipient), 20_000);
+        assert_eq!(at_client.total_supply(), 50_000);
+        assert_eq!(
+            at_client.get_pending_bridge(&bridge_id).unwrap().status,
+            BridgeStatus::Completed,
+        );
+    }
+
+    #[test]
+    fn test_bridge_with_fees_and_expiry() {
+        let (env, ec_id, _mp_id, at_id, _gov_id, _admin) = setup();
+        let at_client = AssetTokenClient::new(&env, &at_id);
+
+        let user = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let pubkey = BytesN::from_array(&env, &[1u8; 32]);
+
+        at_client.mint(&user, &100_000, &1, &ec_id);
+        // 50 bps fee (0.50%), 200s timeout
+        at_client.set_bridge_config(&50, &pool, &200, &10, &pubkey);
+
+        let bridge_id = at_client.bridge_out(
+            &user,
+            &Address::generate(&env),
+            &10_000,
+            &TargetChain::Solana,
+            &Bytes::from_array(&env, &[0xCDu8; 32]),
+        );
+
+        // Fee = 10000 * 50 / 10000 = 50
+        assert_eq!(at_client.balance(&pool), 50);
+        assert_eq!(at_client.balance(&user), 90_000);
+
+        let pending = at_client.get_pending_bridge(&bridge_id).unwrap();
+        assert_eq!(pending.amount, 9_950); // net after fee
+        assert_eq!(pending.fee, 50);
+
+        // Let bridge expire
+        env.ledger().with_mut(|li| {
+            li.timestamp += 300;
+        });
+
+        at_client.expire_bridge(&bridge_id);
+        assert_eq!(
+            at_client.get_pending_bridge(&bridge_id).unwrap().status,
+            BridgeStatus::Failed,
+        );
+    }
+
+    #[test]
+    fn test_bridge_pause_blocks_operations() {
+        let (env, ec_id, _mp_id, at_id, _gov_id, _admin) = setup();
+        let at_client = AssetTokenClient::new(&env, &at_id);
+
+        let user = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let pubkey = BytesN::from_array(&env, &[1u8; 32]);
+
+        at_client.mint(&user, &10_000, &1, &ec_id);
+        at_client.set_bridge_config(&30, &pool, &3600, &5, &pubkey);
+
+        // Pause bridging
+        at_client.set_bridge_paused(&true);
+
+        // bridge_out should fail
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            at_client.bridge_out(
+                &user,
+                &Address::generate(&env),
+                &1000,
+                &TargetChain::Ethereum,
+                &Bytes::from_array(&env, &[0xABu8; 20]),
+            );
+        }));
+        assert!(result.is_err());
+
+        // Unpause and retry
+        at_client.set_bridge_paused(&false);
+        let bridge_id = at_client.bridge_out(
+            &user,
+            &Address::generate(&env),
+            &1000,
+            &TargetChain::Ethereum,
+            &Bytes::from_array(&env, &[0xABu8; 20]),
+        );
+        assert_eq!(
+            at_client.get_pending_bridge(&bridge_id).unwrap().status,
+            BridgeStatus::Pending,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance integration tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_multi_owner_fractional_workflow() {
