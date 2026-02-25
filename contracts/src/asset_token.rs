@@ -445,6 +445,7 @@ mod test {
         let at_id = env.register_contract(None, AssetToken);
         let client = AssetTokenClient::new(&env, &at_id);
 
+
         let admin = Address::generate(&env);
         let name = String::from_str(&env, "Test Asset");
         let symbol = String::from_str(&env, "TSTA");

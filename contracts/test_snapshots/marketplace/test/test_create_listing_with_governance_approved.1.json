@@ -617,6 +617,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "is_fractionalized"
+                              },
+                              "val": {
+                                "bool": false
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "name"
                               },
                               "val": {
@@ -637,6 +645,25 @@
                               },
                               "val": {
                                 "string": "GOV"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_fractions"
+                              },
+                              "val": {
+                                "u64": 0
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "unit_value"
+                              },
+                              "val": {
+                                "i128": {
+                                  "hi": 0,
+                                  "lo": 0
+                                }
                               }
                             }
                           ]
