@@ -53,6 +53,10 @@ func main() {
 		// Marketplace routes
 		v1.POST("/marketplace/list", assetHandler.ListAssetForSale)
 		v1.POST("/marketplace/transfer", assetHandler.TransferAsset)
+
+		// Webhook routes
+		webhookHandler := handlers.NewWebhookHandler(db)
+		router.POST("/webhooks/stellar-events", webhookHandler.HandleStellarEvent)
 	}
 
 	// Start server
