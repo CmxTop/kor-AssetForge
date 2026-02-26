@@ -666,4 +666,220 @@ mod tests {
         // Implement: Call transfer with wrong signer => Should fail auth
         assert!(true);
     }
+
+    // =======================================================================
+    // Buy-Back & Burn Integration Tests
+    // =======================================================================
+
+    #[test]
+    fn test_buyback_full_lifecycle() {
+        let (env, _ec_id, mp_id, _at_id, _gov_id, admin) = setup();
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+
+        // 1. Initialize buy-back system
+        mp_client.initialize_buyback(
+            &admin,
+            &10_000,   // burn_cap
+            &50_000,   // auto_threshold
+            &5_000,    // auto_buyback_amount
+            &30,       // fee_bps (0.30%)
+            &false,    // require_governance
+        );
+
+        assert_eq!(mp_client.get_treasury_balance(), 0);
+        assert_eq!(mp_client.get_total_burned(), 0);
+
+        // 2. Accumulate treasury via deposits
+        mp_client.deposit_to_treasury(&admin, &30_000);
+        assert_eq!(mp_client.get_treasury_balance(), 30_000);
+
+        // 3. Accumulate treasury via fee collection
+        mp_client.collect_fee(&100_000); // 300 fee
+        assert_eq!(mp_client.get_treasury_balance(), 30_300);
+
+        // 4. Execute manual buy-back
+        mp_client.buy_back_tokens(&admin, &8_000, &8_000, &None);
+        assert_eq!(mp_client.get_treasury_balance(), 22_300);
+        assert_eq!(mp_client.get_total_burned(), 8_000);
+
+        // 5. Execute direct burn
+        mp_client.burn_tokens(&admin, &2_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 10_000);
+
+        // 6. Verify history
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_buyback_auto_trigger_from_fees() {
+        let (env, _ec_id, mp_id, _at_id, _gov_id, admin) = setup();
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+
+        // Initialize with low threshold
+        mp_client.initialize_buyback(
+            &admin,
+            &5_000,    // burn_cap
+            &1_000,    // auto_threshold (low)
+            &500,      // auto_buyback_amount
+            &100,      // fee_bps (1%)
+            &false,
+        );
+
+        // Collect enough fees to trigger auto buy-back
+        mp_client.collect_fee(&50_000); // 500 fee
+        assert_eq!(mp_client.get_treasury_balance(), 500);
+        assert!(!mp_client.is_auto_buyback_ready());
+
+        mp_client.collect_fee(&60_000); // 600 fee
+        assert_eq!(mp_client.get_treasury_balance(), 1_100);
+        assert!(mp_client.is_auto_buyback_ready());
+
+        // Auto buy-back executes
+        mp_client.auto_buy_back();
+        assert_eq!(mp_client.get_total_burned(), 500);
+        assert_eq!(mp_client.get_treasury_balance(), 600);
+
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 1);
+        let record = history.get(0).unwrap();
+        assert!(record.auto_triggered);
+    }
+
+    #[test]
+    fn test_buyback_pause_blocks_all_operations() {
+        let (env, _ec_id, mp_id, _at_id, _gov_id, admin) = setup();
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+
+        mp_client.initialize_buyback(
+            &admin,
+            &10_000,
+            &50_000,
+            &5_000,
+            &30,
+            &false,
+        );
+
+        mp_client.deposit_to_treasury(&admin, &100_000);
+
+        // Pause system
+        mp_client.set_buyback_paused(&admin, &true);
+
+        // Buy-back blocked
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
+        }));
+        assert!(result.is_err());
+
+        // Burn blocked
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mp_client.burn_tokens(&admin, &5_000, &None);
+        }));
+        assert!(result.is_err());
+
+        // Auto buy-back blocked
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mp_client.auto_buy_back();
+        }));
+        assert!(result.is_err());
+
+        // Unpause and verify operations work
+        mp_client.set_buyback_paused(&admin, &false);
+        mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+    }
+
+    #[test]
+    fn test_buyback_burn_cap_enforcement() {
+        let (env, _ec_id, mp_id, _at_id, _gov_id, admin) = setup();
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+
+        mp_client.initialize_buyback(
+            &admin,
+            &5_000,    // small burn_cap
+            &50_000,
+            &5_000,
+            &30,
+            &false,
+        );
+
+        mp_client.deposit_to_treasury(&admin, &100_000);
+
+        // Under cap succeeds
+        mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+
+        // Over cap fails
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mp_client.buy_back_tokens(&admin, &5_001, &5_001, &None);
+        }));
+        assert!(result.is_err());
+
+        // Update cap
+        mp_client.set_burn_cap(&admin, &10_000);
+        mp_client.buy_back_tokens(&admin, &8_000, &8_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 13_000);
+    }
+
+    #[test]
+    fn test_buyback_config_update() {
+        let (env, _ec_id, mp_id, _at_id, _gov_id, admin) = setup();
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+
+        mp_client.initialize_buyback(
+            &admin,
+            &10_000,
+            &50_000,
+            &5_000,
+            &30,
+            &false,
+        );
+
+        // Update config
+        mp_client.update_buyback_config(
+            &admin,
+            &20_000,
+            &100_000,
+            &10_000,
+            &50,
+            &true,
+        );
+
+        let config = mp_client.get_buyback_config().unwrap();
+        assert_eq!(config.burn_cap, 20_000);
+        assert_eq!(config.auto_threshold, 100_000);
+        assert_eq!(config.fee_bps, 50);
+        assert!(config.require_governance);
+    }
+
+    #[test]
+    fn test_buyback_reporting_total_burned_tracking() {
+        let (env, _ec_id, mp_id, _at_id, _gov_id, admin) = setup();
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+
+        mp_client.initialize_buyback(
+            &admin,
+            &10_000,
+            &50_000,
+            &5_000,
+            &30,
+            &false,
+        );
+
+        mp_client.deposit_to_treasury(&admin, &100_000);
+
+        // Multiple burn operations
+        mp_client.buy_back_tokens(&admin, &3_000, &3_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 3_000);
+
+        mp_client.burn_tokens(&admin, &2_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+
+        mp_client.buy_back_tokens(&admin, &4_000, &4_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 9_000);
+
+        // History records all operations
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 3);
+    }
 }

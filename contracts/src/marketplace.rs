@@ -1,7 +1,11 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec, Symbol, vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec, vec};
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
 use crate::governance::GovernanceClient;
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
 
 #[derive(Clone)]
 #[contracttype]
@@ -21,11 +25,73 @@ pub enum MarketplaceDataKey {
     Whitelisted(u64, Address),
 }
 
+/// Storage keys for buy-back and burn system.
+#[derive(Clone)]
+#[contracttype]
+pub enum BuyBackDataKey {
+    /// Admin address for buy-back operations
+    Admin,
+    /// Buy-back configuration
+    Config,
+    /// Treasury balance (i128)
+    TreasuryBalance,
+    /// Total tokens burned across all operations (i128)
+    TotalBurned,
+    /// History of buy-back/burn operations
+    History,
+    /// Governance contract address for burn approvals
+    GovernanceContract,
+}
+
+/// Configuration for the buy-back and burn system.
+#[derive(Clone)]
+#[contracttype]
+pub struct BuyBackConfig {
+    /// Maximum tokens that can be burned in a single operation
+    pub burn_cap: i128,
+    /// Treasury balance threshold that triggers auto buy-back
+    pub auto_threshold: i128,
+    /// Amount to buy back when auto-triggered
+    pub auto_buyback_amount: i128,
+    /// Whether governance approval is required for burns
+    pub require_governance: bool,
+    /// Fee percentage (basis points) collected from marketplace trades
+    pub fee_bps: u32,
+    /// Whether the buy-back system is paused
+    pub paused: bool,
+}
+
+/// Record of a buy-back or burn operation for audit trail.
+#[derive(Clone)]
+#[contracttype]
+pub struct BuyBackRecord {
+    /// Amount of tokens bought back
+    pub amount: i128,
+    /// Amount of tokens burned
+    pub burned: i128,
+    /// Source of funds used (treasury)
+    pub source_funds: i128,
+    /// Ledger timestamp when the operation occurred
+    pub timestamp: u64,
+    /// Address that triggered the operation
+    pub executor: Address,
+    /// Whether this was an auto-triggered buy-back
+    pub auto_triggered: bool,
+}
+
+// ============================================================================
+// CONTRACT
+// ============================================================================
+
 #[contract]
 pub struct Marketplace;
 
 #[contractimpl]
 impl Marketplace {
+    // -----------------------------------------------------------------------
+    // Marketplace Operations (existing)
+    // -----------------------------------------------------------------------
+
     /// List an asset for sale.
     /// Blocked if the asset is paused for Trading scope.
     /// Requires the asset to have been approved via governance.
@@ -112,6 +178,10 @@ impl Marketplace {
         None
     }
 
+    // -----------------------------------------------------------------------
+    // Whitelisting – Admin & Privacy Management
+    // -----------------------------------------------------------------------
+
     /// Initialize the marketplace with an admin
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&MarketplaceDataKey::Admin) {
@@ -176,6 +246,624 @@ impl Marketplace {
                 panic!("user not whitelisted for private asset");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Buy-Back & Burn System – Initialization
+    // -----------------------------------------------------------------------
+
+    /// Initialize the buy-back and burn system.
+    ///
+    /// # Arguments
+    /// * `admin` – Admin address authorized for buy-back operations.
+    /// * `burn_cap` – Maximum tokens that can be burned per operation.
+    /// * `auto_threshold` – Treasury balance threshold to trigger auto buy-back.
+    /// * `auto_buyback_amount` – Amount to buy-back when auto-triggered.
+    /// * `fee_bps` – Marketplace fee in basis points (e.g., 30 = 0.30%).
+    /// * `require_governance` – Whether governance approval is required for burns.
+    pub fn initialize_buyback(
+        env: Env,
+        admin: Address,
+        burn_cap: i128,
+        auto_threshold: i128,
+        auto_buyback_amount: i128,
+        fee_bps: u32,
+        require_governance: bool,
+    ) {
+        admin.require_auth();
+
+        if env.storage().instance().has(&BuyBackDataKey::Admin) {
+            panic!("buy-back system already initialized");
+        }
+
+        if burn_cap <= 0 {
+            panic!("burn cap must be positive");
+        }
+        if auto_threshold < 0 {
+            panic!("auto threshold must be non-negative");
+        }
+        if auto_buyback_amount < 0 {
+            panic!("auto buyback amount must be non-negative");
+        }
+        if fee_bps > 10_000 {
+            panic!("fee basis points must not exceed 10000");
+        }
+
+        env.storage().instance().set(&BuyBackDataKey::Admin, &admin);
+
+        let config = BuyBackConfig {
+            burn_cap,
+            auto_threshold,
+            auto_buyback_amount,
+            require_governance,
+            fee_bps,
+            paused: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::Config, &config);
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TreasuryBalance, &0i128);
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TotalBurned, &0i128);
+
+        let history: Vec<BuyBackRecord> = Vec::new(&env);
+        env.storage()
+            .persistent()
+            .set(&BuyBackDataKey::History, &history);
+
+        env.events().publish(
+            (Symbol::new(&env, "buyback_initialized"),),
+            (admin, burn_cap, fee_bps),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Buy-Back & Burn System – Treasury Management
+    // -----------------------------------------------------------------------
+
+    /// Deposit funds into the buy-back treasury.
+    /// Typically called when marketplace fees are collected.
+    ///
+    /// # Arguments
+    /// * `depositor` – The address depositing funds.
+    /// * `amount` – Amount to deposit into the treasury.
+    pub fn deposit_to_treasury(env: Env, depositor: Address, amount: i128) {
+        depositor.require_auth();
+
+        if amount <= 0 {
+            panic!("deposit amount must be positive");
+        }
+
+        Self::require_buyback_initialized(&env);
+
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::TreasuryBalance)
+            .unwrap_or(0);
+
+        let new_balance = current
+            .checked_add(amount)
+            .expect("treasury balance overflow");
+
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TreasuryBalance, &new_balance);
+
+        env.events()
+            .publish((Symbol::new(&env, "treasury_deposit"), depositor), amount);
+    }
+
+    /// Collect a fee from a trade amount and deposit it into the treasury.
+    /// Called internally during marketplace `purchase` operations.
+    ///
+    /// # Arguments
+    /// * `trade_amount` – The total trade amount to calculate fee from.
+    ///
+    /// # Returns
+    /// The fee amount collected.
+    pub fn collect_fee(env: Env, trade_amount: i128) -> i128 {
+        Self::require_buyback_initialized(&env);
+
+        let config: BuyBackConfig = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Config)
+            .expect("buy-back not configured");
+
+        let fee = trade_amount
+            .checked_mul(config.fee_bps as i128)
+            .expect("fee calculation overflow")
+            / 10_000;
+
+        if fee > 0 {
+            let current: i128 = env
+                .storage()
+                .instance()
+                .get(&BuyBackDataKey::TreasuryBalance)
+                .unwrap_or(0);
+
+            let new_balance = current.checked_add(fee).expect("treasury balance overflow");
+
+            env.storage()
+                .instance()
+                .set(&BuyBackDataKey::TreasuryBalance, &new_balance);
+
+            env.events()
+                .publish((Symbol::new(&env, "fee_collected"),), (trade_amount, fee));
+        }
+
+        fee
+    }
+
+    // -----------------------------------------------------------------------
+    // Buy-Back & Burn System – Core Operations
+    // -----------------------------------------------------------------------
+
+    /// Buy back tokens using treasury funds.
+    ///
+    /// Uses accumulated treasury funds to buy back tokens from the market.
+    /// In production, this would integrate with Stellar's path payments / DEX.
+    /// Currently simulates the purchase and removes tokens from circulation.
+    ///
+    /// # Arguments
+    /// * `admin` – Must be the buy-back admin.
+    /// * `amount` – Amount of tokens to buy back.
+    /// * `source_funds` – Treasury funds to use for the buy-back.
+    /// * `governance_id` – Optional governance contract for approval check.
+    pub fn buy_back_tokens(
+        env: Env,
+        admin: Address,
+        amount: i128,
+        source_funds: i128,
+        governance_id: Option<Address>,
+    ) {
+        admin.require_auth();
+        Self::require_buyback_admin(&env, &admin);
+        Self::require_buyback_not_paused(&env);
+
+        if amount <= 0 {
+            panic!("buy-back amount must be positive");
+        }
+        if source_funds <= 0 {
+            panic!("source funds must be positive");
+        }
+
+        let config: BuyBackConfig = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Config)
+            .expect("buy-back not configured");
+
+        // Enforce burn cap
+        if amount > config.burn_cap {
+            panic!("amount exceeds burn cap");
+        }
+
+        // Check treasury has sufficient funds
+        let treasury: i128 = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::TreasuryBalance)
+            .unwrap_or(0);
+
+        if treasury < source_funds {
+            panic!("insufficient treasury funds");
+        }
+
+        // Enforce governance approval if required
+        if config.require_governance {
+            if let Some(gov_addr) = governance_id {
+                let gov_client = GovernanceClient::new(&env, &gov_addr);
+                // Use asset_id 0 as a sentinel for buy-back governance proposals
+                gov_client.require_approved(&0);
+            } else {
+                panic!("governance approval required but no governance contract provided");
+            }
+        }
+
+        // Deduct from treasury
+        let new_treasury = treasury
+            .checked_sub(source_funds)
+            .expect("treasury underflow");
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TreasuryBalance, &new_treasury);
+
+        // Update total burned
+        let total_burned: i128 = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::TotalBurned)
+            .unwrap_or(0);
+        let new_total_burned = total_burned
+            .checked_add(amount)
+            .expect("total burned overflow");
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TotalBurned, &new_total_burned);
+
+        // Record in history
+        let record = BuyBackRecord {
+            amount,
+            burned: amount,
+            source_funds,
+            timestamp: env.ledger().timestamp(),
+            executor: admin.clone(),
+            auto_triggered: false,
+        };
+        Self::append_buyback_history(&env, record);
+
+        // Emit buy-back event
+        env.events().publish(
+            (Symbol::new(&env, "buy_back_executed"), admin),
+            (amount, source_funds),
+        );
+
+        // Emit burn event
+        env.events().publish(
+            (Symbol::new(&env, "tokens_burned"),),
+            (amount, new_total_burned),
+        );
+    }
+
+    /// Burn tokens directly from the treasury allocation.
+    ///
+    /// Reduces total supply by removing tokens permanently.
+    /// Subject to burn cap and optional governance approval.
+    ///
+    /// # Arguments
+    /// * `admin` – Must be the buy-back admin.
+    /// * `amount` – Amount of tokens to burn.
+    /// * `governance_id` – Optional governance contract for approval check.
+    pub fn burn_tokens(env: Env, admin: Address, amount: i128, governance_id: Option<Address>) {
+        admin.require_auth();
+        Self::require_buyback_admin(&env, &admin);
+        Self::require_buyback_not_paused(&env);
+
+        if amount <= 0 {
+            panic!("burn amount must be positive");
+        }
+
+        let config: BuyBackConfig = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Config)
+            .expect("buy-back not configured");
+
+        // Enforce burn cap
+        if amount > config.burn_cap {
+            panic!("burn amount exceeds burn cap");
+        }
+
+        // Enforce governance approval if required
+        if config.require_governance {
+            if let Some(gov_addr) = governance_id {
+                let gov_client = GovernanceClient::new(&env, &gov_addr);
+                gov_client.require_approved(&0);
+            } else {
+                panic!("governance approval required but no governance contract provided");
+            }
+        }
+
+        // Update total burned
+        let total_burned: i128 = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::TotalBurned)
+            .unwrap_or(0);
+        let new_total_burned = total_burned
+            .checked_add(amount)
+            .expect("total burned overflow");
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TotalBurned, &new_total_burned);
+
+        // Record in history
+        let record = BuyBackRecord {
+            amount: 0,
+            burned: amount,
+            source_funds: 0,
+            timestamp: env.ledger().timestamp(),
+            executor: admin.clone(),
+            auto_triggered: false,
+        };
+        Self::append_buyback_history(&env, record);
+
+        // Emit burn event
+        env.events().publish(
+            (Symbol::new(&env, "tokens_burned"),),
+            (amount, new_total_burned),
+        );
+    }
+
+    /// Auto buy-back triggered when treasury balance exceeds the threshold.
+    ///
+    /// Anyone can call this function, but it only executes if:
+    /// - The treasury balance exceeds `auto_threshold`
+    /// - The buy-back system is not paused
+    /// - The auto-buyback amount does not exceed the burn cap
+    pub fn auto_buy_back(env: Env) {
+        Self::require_buyback_initialized(&env);
+        Self::require_buyback_not_paused(&env);
+
+        let config: BuyBackConfig = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Config)
+            .expect("buy-back not configured");
+
+        if config.auto_threshold <= 0 || config.auto_buyback_amount <= 0 {
+            panic!("auto buy-back not configured");
+        }
+
+        let treasury: i128 = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::TreasuryBalance)
+            .unwrap_or(0);
+
+        if treasury < config.auto_threshold {
+            panic!("treasury below auto threshold");
+        }
+
+        // Enforce burn cap on auto amount
+        let buyback_amount = if config.auto_buyback_amount > config.burn_cap {
+            config.burn_cap
+        } else {
+            config.auto_buyback_amount
+        };
+
+        // Deduct from treasury (use buyback_amount as proxy for cost)
+        let new_treasury = treasury
+            .checked_sub(buyback_amount)
+            .expect("treasury underflow");
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TreasuryBalance, &new_treasury);
+
+        // Update total burned
+        let total_burned: i128 = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::TotalBurned)
+            .unwrap_or(0);
+        let new_total_burned = total_burned
+            .checked_add(buyback_amount)
+            .expect("total burned overflow");
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::TotalBurned, &new_total_burned);
+
+        // Record in history
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Admin)
+            .expect("admin not set");
+
+        let record = BuyBackRecord {
+            amount: buyback_amount,
+            burned: buyback_amount,
+            source_funds: buyback_amount,
+            timestamp: env.ledger().timestamp(),
+            executor: admin,
+            auto_triggered: true,
+        };
+        Self::append_buyback_history(&env, record);
+
+        // Emit events
+        env.events().publish(
+            (Symbol::new(&env, "buy_back_executed"),),
+            (buyback_amount, true), // (amount, auto_triggered)
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "tokens_burned"),),
+            (buyback_amount, new_total_burned),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Buy-Back & Burn System – Configuration Management
+    // -----------------------------------------------------------------------
+
+    /// Update the buy-back configuration. Admin only.
+    ///
+    /// # Arguments
+    /// * `admin` – Must be the buy-back admin.
+    /// * `burn_cap` – New maximum burn per operation.
+    /// * `auto_threshold` – New auto-trigger threshold.
+    /// * `auto_buyback_amount` – New auto buy-back amount.
+    /// * `fee_bps` – New fee in basis points.
+    /// * `require_governance` – Whether governance is required.
+    pub fn update_buyback_config(
+        env: Env,
+        admin: Address,
+        burn_cap: i128,
+        auto_threshold: i128,
+        auto_buyback_amount: i128,
+        fee_bps: u32,
+        require_governance: bool,
+    ) {
+        admin.require_auth();
+        Self::require_buyback_admin(&env, &admin);
+
+        if burn_cap <= 0 {
+            panic!("burn cap must be positive");
+        }
+        if fee_bps > 10_000 {
+            panic!("fee basis points must not exceed 10000");
+        }
+
+        let config = BuyBackConfig {
+            burn_cap,
+            auto_threshold,
+            auto_buyback_amount,
+            require_governance,
+            fee_bps,
+            paused: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::Config, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "buyback_config_updated"), admin),
+            (burn_cap, auto_threshold, fee_bps),
+        );
+    }
+
+    /// Set the burn cap. Admin only.
+    /// Provides a dedicated function for governance to adjust the burn cap.
+    pub fn set_burn_cap(env: Env, admin: Address, new_cap: i128) {
+        admin.require_auth();
+        Self::require_buyback_admin(&env, &admin);
+
+        if new_cap <= 0 {
+            panic!("burn cap must be positive");
+        }
+
+        let mut config: BuyBackConfig = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Config)
+            .expect("buy-back not configured");
+
+        config.burn_cap = new_cap;
+
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::Config, &config);
+
+        env.events()
+            .publish((Symbol::new(&env, "burn_cap_updated"),), new_cap);
+    }
+
+    /// Pause or unpause the buy-back system. Admin only.
+    pub fn set_buyback_paused(env: Env, admin: Address, paused: bool) {
+        admin.require_auth();
+        Self::require_buyback_admin(&env, &admin);
+
+        let mut config: BuyBackConfig = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Config)
+            .expect("buy-back not configured");
+
+        config.paused = paused;
+
+        env.storage()
+            .instance()
+            .set(&BuyBackDataKey::Config, &config);
+
+        env.events()
+            .publish((Symbol::new(&env, "buyback_paused"),), paused);
+    }
+
+    // -----------------------------------------------------------------------
+    // Buy-Back & Burn System – Query Functions
+    // -----------------------------------------------------------------------
+
+    /// Get the current treasury balance.
+    pub fn get_treasury_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&BuyBackDataKey::TreasuryBalance)
+            .unwrap_or(0)
+    }
+
+    /// Get the total tokens burned across all operations.
+    pub fn get_total_burned(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&BuyBackDataKey::TotalBurned)
+            .unwrap_or(0)
+    }
+
+    /// Get the current buy-back configuration.
+    pub fn get_buyback_config(env: Env) -> Option<BuyBackConfig> {
+        env.storage().instance().get(&BuyBackDataKey::Config)
+    }
+
+    /// Get the buy-back operation history.
+    pub fn get_buyback_history(env: Env) -> Vec<BuyBackRecord> {
+        env.storage()
+            .persistent()
+            .get(&BuyBackDataKey::History)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Check whether the auto buy-back threshold has been reached.
+    pub fn is_auto_buyback_ready(env: Env) -> bool {
+        let config: Option<BuyBackConfig> = env.storage().instance().get(&BuyBackDataKey::Config);
+
+        if let Some(c) = config {
+            if c.paused || c.auto_threshold <= 0 {
+                return false;
+            }
+            let treasury: i128 = env
+                .storage()
+                .instance()
+                .get(&BuyBackDataKey::TreasuryBalance)
+                .unwrap_or(0);
+            treasury >= c.auto_threshold
+        } else {
+            false
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Buy-Back & Burn System – Internal Helpers
+    // -----------------------------------------------------------------------
+
+    /// Verify that the buy-back system has been initialized.
+    fn require_buyback_initialized(env: &Env) {
+        if !env.storage().instance().has(&BuyBackDataKey::Admin) {
+            panic!("buy-back system not initialized");
+        }
+    }
+
+    /// Verify the caller is the buy-back admin.
+    fn require_buyback_admin(env: &Env, caller: &Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Admin)
+            .expect("buy-back system not initialized");
+        if *caller != stored_admin {
+            panic!("caller is not buy-back admin");
+        }
+    }
+
+    /// Verify the buy-back system is not paused.
+    fn require_buyback_not_paused(env: &Env) {
+        let config: BuyBackConfig = env
+            .storage()
+            .instance()
+            .get(&BuyBackDataKey::Config)
+            .expect("buy-back not configured");
+        if config.paused {
+            panic!("buy-back system is paused");
+        }
+    }
+
+    /// Append a BuyBackRecord to the history.
+    fn append_buyback_history(env: &Env, record: BuyBackRecord) {
+        let mut history: Vec<BuyBackRecord> = env
+            .storage()
+            .persistent()
+            .get(&BuyBackDataKey::History)
+            .unwrap_or(Vec::new(env));
+        history.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&BuyBackDataKey::History, &history);
     }
 }
 
@@ -398,9 +1086,6 @@ mod test {
         // This should pass with admin auth
         mp_client.set_asset_privacy(&admin, &1, &true);
         assert!(mp_client.is_private(&1));
-
-        // This should panic because not_admin is not the stored admin
-        // Note: mock_all_auths handles require_auth, but our logic checks the stored address
     }
 
     #[test]
@@ -504,5 +1189,473 @@ mod test {
         let buyer = Address::generate(&env);
         // Not whitelisted, should panic
         mp_client.purchase(&buyer, &1, &50, &asset_id, &ec_id);
+    }
+
+    // =======================================================================
+    // Buy-Back & Burn System Tests
+    // =======================================================================
+
+    /// Helper: deploy marketplace and initialize buy-back system.
+    fn setup_buyback() -> (Env, Address, MarketplaceClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+
+        mp_client.initialize_buyback(
+            &admin, &10_000, // burn_cap
+            &50_000, // auto_threshold
+            &5_000,  // auto_buyback_amount
+            &30,     // fee_bps (0.30%)
+            &false,  // require_governance
+        );
+
+        (env, mp_id, mp_client, admin)
+    }
+
+    // -----------------------------------------------------------------------
+    // Initialization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_initialize_buyback_success() {
+        let (_env, _mp_id, mp_client, _admin) = setup_buyback();
+
+        assert_eq!(mp_client.get_treasury_balance(), 0);
+        assert_eq!(mp_client.get_total_burned(), 0);
+
+        let config = mp_client.get_buyback_config().unwrap();
+        assert_eq!(config.burn_cap, 10_000);
+        assert_eq!(config.auto_threshold, 50_000);
+        assert_eq!(config.auto_buyback_amount, 5_000);
+        assert_eq!(config.fee_bps, 30);
+        assert!(!config.require_governance);
+        assert!(!config.paused);
+    }
+
+    #[test]
+    #[should_panic(expected = "buy-back system already initialized")]
+    fn test_initialize_buyback_twice_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.initialize_buyback(&admin, &10_000, &50_000, &5_000, &30, &false);
+    }
+
+    #[test]
+    #[should_panic(expected = "burn cap must be positive")]
+    fn test_initialize_buyback_zero_burn_cap_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+        mp_client.initialize_buyback(&admin, &0, &50_000, &5_000, &30, &false);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee basis points must not exceed 10000")]
+    fn test_initialize_buyback_invalid_fee_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+        mp_client.initialize_buyback(&admin, &10_000, &50_000, &5_000, &10_001, &false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Treasury deposit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_deposit_to_treasury() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        mp_client.deposit_to_treasury(&admin, &25_000);
+        assert_eq!(mp_client.get_treasury_balance(), 25_000);
+
+        mp_client.deposit_to_treasury(&admin, &10_000);
+        assert_eq!(mp_client.get_treasury_balance(), 35_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "deposit amount must be positive")]
+    fn test_deposit_to_treasury_zero_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "deposit amount must be positive")]
+    fn test_deposit_to_treasury_negative_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &-100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fee collection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_collect_fee() {
+        let (_env, _mp_id, mp_client, _admin) = setup_buyback();
+
+        // 30 bps on 100_000 = 300
+        let fee = mp_client.collect_fee(&100_000);
+        assert_eq!(fee, 300);
+        assert_eq!(mp_client.get_treasury_balance(), 300);
+    }
+
+    #[test]
+    fn test_collect_fee_accumulates() {
+        let (_env, _mp_id, mp_client, _admin) = setup_buyback();
+
+        mp_client.collect_fee(&100_000); // 300
+        mp_client.collect_fee(&200_000); // 600
+        assert_eq!(mp_client.get_treasury_balance(), 900);
+    }
+
+    // -----------------------------------------------------------------------
+    // Buy-back tokens tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_buy_back_tokens_success() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        // Fund treasury
+        mp_client.deposit_to_treasury(&admin, &50_000);
+
+        // Buy back 5000 tokens using 5000 from treasury
+        mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
+
+        assert_eq!(mp_client.get_treasury_balance(), 45_000);
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 1);
+        let record = history.get(0).unwrap();
+        assert_eq!(record.amount, 5_000);
+        assert_eq!(record.burned, 5_000);
+        assert_eq!(record.source_funds, 5_000);
+        assert!(!record.auto_triggered);
+    }
+
+    #[test]
+    fn test_buy_back_tokens_multiple_operations() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        mp_client.deposit_to_treasury(&admin, &50_000);
+
+        mp_client.buy_back_tokens(&admin, &3_000, &3_000, &None);
+        mp_client.buy_back_tokens(&admin, &2_000, &2_000, &None);
+
+        assert_eq!(mp_client.get_treasury_balance(), 45_000);
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "buy-back amount must be positive")]
+    fn test_buy_back_tokens_zero_amount_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &50_000);
+        mp_client.buy_back_tokens(&admin, &0, &5_000, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "amount exceeds burn cap")]
+    fn test_buy_back_tokens_exceeds_burn_cap_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &50_000);
+        // burn_cap is 10_000, trying 15_000
+        mp_client.buy_back_tokens(&admin, &15_000, &15_000, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient treasury funds")]
+    fn test_buy_back_tokens_insufficient_treasury_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &1_000);
+        mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not buy-back admin")]
+    fn test_buy_back_tokens_non_admin_panics() {
+        let (env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &50_000);
+        let non_admin = Address::generate(&env);
+        mp_client.buy_back_tokens(&non_admin, &5_000, &5_000, &None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Burn tokens tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_burn_tokens_success() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        mp_client.burn_tokens(&admin, &5_000, &None);
+
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 1);
+        let record = history.get(0).unwrap();
+        assert_eq!(record.burned, 5_000);
+        assert_eq!(record.amount, 0); // direct burn, no buy-back
+    }
+
+    #[test]
+    #[should_panic(expected = "burn amount must be positive")]
+    fn test_burn_tokens_zero_amount_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.burn_tokens(&admin, &0, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "burn amount exceeds burn cap")]
+    fn test_burn_tokens_exceeds_cap_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.burn_tokens(&admin, &15_000, &None); // cap is 10_000
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not buy-back admin")]
+    fn test_burn_tokens_non_admin_panics() {
+        let (env, _mp_id, mp_client, _admin) = setup_buyback();
+        let non_admin = Address::generate(&env);
+        mp_client.burn_tokens(&non_admin, &5_000, &None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto buy-back tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_buy_back_triggers_above_threshold() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        // Fund treasury above auto_threshold (50_000)
+        mp_client.deposit_to_treasury(&admin, &60_000);
+
+        assert!(mp_client.is_auto_buyback_ready());
+
+        mp_client.auto_buy_back();
+
+        // auto_buyback_amount = 5_000 deducted
+        assert_eq!(mp_client.get_treasury_balance(), 55_000);
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 1);
+        let record = history.get(0).unwrap();
+        assert!(record.auto_triggered);
+        assert_eq!(record.amount, 5_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "treasury below auto threshold")]
+    fn test_auto_buy_back_below_threshold_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &10_000);
+        assert!(!mp_client.is_auto_buyback_ready());
+        mp_client.auto_buy_back();
+    }
+
+    #[test]
+    fn test_auto_buy_back_respects_burn_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+
+        // Set auto_buyback_amount (20_000) > burn_cap (5_000)
+        mp_client.initialize_buyback(
+            &admin, &5_000,  // burn_cap
+            &10_000, // auto_threshold
+            &20_000, // auto_buyback_amount (exceeds cap)
+            &30, &false,
+        );
+
+        mp_client.deposit_to_treasury(&admin, &50_000);
+        mp_client.auto_buy_back();
+
+        // Should burn only up to burn_cap (5_000)
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+        assert_eq!(mp_client.get_treasury_balance(), 45_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pause tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "buy-back system is paused")]
+    fn test_buy_back_tokens_paused_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &50_000);
+        mp_client.set_buyback_paused(&admin, &true);
+        mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "buy-back system is paused")]
+    fn test_burn_tokens_paused_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.set_buyback_paused(&admin, &true);
+        mp_client.burn_tokens(&admin, &5_000, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "buy-back system is paused")]
+    fn test_auto_buy_back_paused_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &60_000);
+        mp_client.set_buyback_paused(&admin, &true);
+        mp_client.auto_buy_back();
+    }
+
+    #[test]
+    fn test_pause_unpause_cycle() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &50_000);
+
+        // Pause
+        mp_client.set_buyback_paused(&admin, &true);
+        let config = mp_client.get_buyback_config().unwrap();
+        assert!(config.paused);
+
+        // Unpause
+        mp_client.set_buyback_paused(&admin, &false);
+        let config = mp_client.get_buyback_config().unwrap();
+        assert!(!config.paused);
+
+        // Operations work after unpause
+        mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
+        assert_eq!(mp_client.get_total_burned(), 5_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration update tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_buyback_config() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        mp_client.update_buyback_config(
+            &admin, &20_000,  // new burn_cap
+            &100_000, // new auto_threshold
+            &10_000,  // new auto_buyback_amount
+            &50,      // new fee_bps
+            &false,
+        );
+
+        let config = mp_client.get_buyback_config().unwrap();
+        assert_eq!(config.burn_cap, 20_000);
+        assert_eq!(config.auto_threshold, 100_000);
+        assert_eq!(config.auto_buyback_amount, 10_000);
+        assert_eq!(config.fee_bps, 50);
+    }
+
+    #[test]
+    fn test_set_burn_cap() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        mp_client.set_burn_cap(&admin, &25_000);
+        let config = mp_client.get_buyback_config().unwrap();
+        assert_eq!(config.burn_cap, 25_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "burn cap must be positive")]
+    fn test_set_burn_cap_zero_panics() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.set_burn_cap(&admin, &0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reporting and history tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_buyback_history_tracks_operations() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+        mp_client.deposit_to_treasury(&admin, &50_000);
+
+        // Multiple operations
+        mp_client.buy_back_tokens(&admin, &3_000, &3_000, &None);
+        mp_client.burn_tokens(&admin, &2_000, &None);
+        mp_client.buy_back_tokens(&admin, &1_000, &1_000, &None);
+
+        let history = mp_client.get_buyback_history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(mp_client.get_total_burned(), 6_000);
+    }
+
+    #[test]
+    fn test_is_auto_buyback_ready_reflects_state() {
+        let (_env, _mp_id, mp_client, admin) = setup_buyback();
+
+        // Below threshold
+        assert!(!mp_client.is_auto_buyback_ready());
+
+        mp_client.deposit_to_treasury(&admin, &30_000);
+        assert!(!mp_client.is_auto_buyback_ready());
+
+        mp_client.deposit_to_treasury(&admin, &25_000);
+        assert!(mp_client.is_auto_buyback_ready());
+
+        // After auto buy-back drains below threshold
+        mp_client.auto_buy_back();
+        assert!(mp_client.is_auto_buyback_ready()); // 50_000 still >= 50_000
+
+        // Pause makes it not ready
+        mp_client.set_buyback_paused(&admin, &true);
+        assert!(!mp_client.is_auto_buyback_ready());
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance-gated burn tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "governance approval required but no governance contract provided")]
+    fn test_burn_tokens_governance_required_no_contract_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+
+        // Initialize with require_governance = true
+        mp_client.initialize_buyback(&admin, &10_000, &50_000, &5_000, &30, &true);
+
+        mp_client.burn_tokens(&admin, &5_000, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "governance approval required but no governance contract provided")]
+    fn test_buy_back_governance_required_no_contract_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+
+        mp_client.initialize_buyback(&admin, &10_000, &50_000, &5_000, &30, &true);
+        mp_client.deposit_to_treasury(&admin, &50_000);
+
+        mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
     }
 }
