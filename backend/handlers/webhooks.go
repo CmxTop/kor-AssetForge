@@ -1,0 +1,110 @@
+package handlers
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+
+	"github.com/gin-gonic/gin"
+	"github.com/yourusername/kor-assetforge/models"
+	"gorm.io/gorm"
+)
+
+type WebhookHandler struct {
+	db *gorm.DB
+}
+
+func NewWebhookHandler(db *gorm.DB) *WebhookHandler {
+	return &WebhookHandler{db: db}
+}
+
+// StellarEvent represents the payload from Stellar Horizon events
+type StellarEvent struct {
+	ID          string          `json:"id"`
+	PagingToken string          `json:"paging_token"`
+	Type        string          `json:"type"`
+	ContractID  string          `json:"contract_id"`
+	Topic       []string        `json:"topic"`
+	Value       json.RawMessage `json:"value"`
+	Ledger      int32           `json:"ledger"`
+	CreatedAt   string          `json:"created_at"`
+}
+
+// HandleStellarEvent processes events received from Stellar Horizon
+func (h *WebhookHandler) HandleStellarEvent(c *gin.Context) {
+	// 1. Verify Signature
+	signature := c.GetHeader("X-Stellar-Signature")
+	secret := os.Getenv("WEBHOOK_SECRET")
+
+	if secret != "" && signature != "" {
+		body, _ := io.ReadAll(c.Request.Body)
+		if !verifySignature(body, signature, secret) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid signature"})
+			return
+		}
+		// Reset body for binding
+		c.Request.Body = io.NopCloser(json.RawMessage(body))
+	}
+
+	var event StellarEvent
+	if err := c.ShouldBindJSON(&event); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid event payload"})
+		return
+	}
+
+	// 2. Idempotency Check
+	// In a real app, we would store event IDs in a separate table
+	log.Printf("Processing Stellar event: %s (Type: %s)", event.ID, event.Type)
+
+	// 3. Parse and Process Event
+	// Filter for Soroban events (topics are used to identify the event type)
+	if len(event.Topic) > 0 {
+		eventType := event.Topic[0]
+		
+		switch eventType {
+		case "minted":
+			h.processMintEvent(event)
+		case "listed":
+			h.processListingEvent(event)
+		case "transfer":
+			h.processTransferEvent(event)
+		default:
+			log.Printf("Ignoring unknown event type: %s", eventType)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "processed", "event_id": event.ID})
+}
+
+func (h *WebhookHandler) processMintEvent(event StellarEvent) {
+	// Sync asset status in DB
+	// Extract asset ID or symbol from topic/value
+	log.Printf("Syncing asset status for contract: %s", event.ContractID)
+	
+	var asset models.Asset
+	if err := h.db.Where("contract_id = ?", event.ContractID).First(&asset).Error; err == nil {
+		h.db.Model(&asset).Update("verified", true)
+		log.Printf("Asset %s marked as verified on-chain", asset.Symbol)
+	}
+}
+
+func (h *WebhookHandler) processListingEvent(event StellarEvent) {
+	log.Printf("New marketplace listing detected on-chain for contract: %s", event.ContractID)
+}
+
+func (h *WebhookHandler) processTransferEvent(event StellarEvent) {
+	log.Printf("Asset transfer detected on-chain for contract: %s", event.ContractID)
+}
+
+func verifySignature(payload []byte, signature, secret string) bool {
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write(payload)
+	expectedSignature := hex.EncodeToString(h.Sum(nil))
+	return hmac.Equal([]byte(signature), []byte(expectedSignature))
+}
