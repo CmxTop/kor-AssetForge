@@ -14,10 +14,10 @@ mod tests {
     use kor_assetforge_contracts::emergency_control::{
         EmergencyControl, EmergencyControlClient, PauseScope,
     };
-    use kor_assetforge_contracts::governance::{Governance, GovernanceClient, ProposalStatus};
+    use kor_assetforge_contracts::governance::{Governance, GovernanceClient};
     use kor_assetforge_contracts::marketplace::{Marketplace, MarketplaceClient};
     use soroban_sdk::testutils::{Address as _, Ledger as _};
-    use soroban_sdk::{Address, Bytes, BytesN, Env, IntoVal, String};
+    use soroban_sdk::{Address, Bytes, BytesN, Env, String};
 
     /// Helper: set up the environment with all contracts deployed.
     fn setup() -> (
@@ -298,11 +298,6 @@ mod tests {
         // Implement: Call transfer with unauthorized signer => Should fail
         assert!(true);
     }
-        // 3. Verify schedule info
-        let info = at_client
-            .get_dividend_info(&1)
-            .expect("dividend not scheduled");
-        assert_eq!(info.total_dividend, 100_000_000);
 
     #[test]
     fn test_fractional_transfer_insufficient_balance() {
