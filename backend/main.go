@@ -29,7 +29,11 @@ func main() {
 	}
 
 	// Setup router
-	router := gin.Default()
+	router := gin.New() // Use gin.New() instead of gin.Default() to avoid default logger/recovery
+	
+	// Use custom enhanced middleware
+	router.Use(handlers.RequestLogger())
+	router.Use(handlers.GlobalErrorHandler())
 
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
