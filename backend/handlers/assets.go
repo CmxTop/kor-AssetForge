@@ -97,16 +97,48 @@ func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 	})
 }
 
-// ListAssets returns all assets
+// ListAssets returns all assets with pagination
 func (h *AssetHandler) ListAssets(c *gin.Context) {
 	var assets []models.Asset
+	var total int64
+	page, limit := utils.GetPaginationParams(c)
 
-	if err := h.db.Find(&assets).Error; err != nil {
+	if err := utils.Paginate(h.db, page, limit, &total, &assets); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch assets"})
 		return
 	}
 
-	c.JSON(http.StatusOK, assets)
+	c.JSON(http.StatusOK, utils.Pagination{
+		Limit: limit,
+		Page:  page,
+		Total: total,
+		Data:  assets,
+	})
+}
+
+// ListTransactions returns all transactions with pagination
+func (h *AssetHandler) ListTransactions(c *gin.Context) {
+	var transactions []models.Transaction
+	var total int64
+	page, limit := utils.GetPaginationParams(c)
+
+	// Build query (allow filtering by asset_id if provided)
+	query := h.db.Model(&models.Transaction{}).Order("created_at desc")
+	if assetID := c.Query("asset_id"); assetID != "" {
+		query = query.Where("asset_id = ?", assetID)
+	}
+
+	if err := utils.Paginate(query, page, limit, &total, &transactions); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch transactions"})
+		return
+	}
+
+	c.JSON(http.StatusOK, utils.Pagination{
+		Limit: limit,
+		Page:  page,
+		Total: total,
+		Data:  transactions,
+	})
 }
 
 // GetAsset returns a specific asset
