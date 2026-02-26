@@ -45,7 +45,8 @@ func main() {
 	{
 		// Asset routes
 		assetHandler := handlers.NewAssetHandler(db, stellarClient)
-		v1.POST("/assets", assetHandler.CreateAsset)
+		v1.POST("/assets/tokenize", assetHandler.TokenizeAsset)
+		v1.POST("/assets", assetHandler.TokenizeAsset) // Keep old path for compatibility if needed or just replace it
 		v1.GET("/assets", assetHandler.ListAssets)
 		v1.GET("/assets/:id", assetHandler.GetAsset)
 

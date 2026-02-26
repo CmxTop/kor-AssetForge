@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -22,17 +23,17 @@ func NewAssetHandler(db *gorm.DB, stellarClient *utils.StellarClient) *AssetHand
 	}
 }
 
-// CreateAsset handles asset tokenization
-func (h *AssetHandler) CreateAsset(c *gin.Context) {
+// TokenizeAsset handles formal asset tokenization with Soroban integration
+func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 	var req struct {
-		Name         string `json:"name" binding:"required"`
-		Symbol       string `json:"symbol" binding:"required"`
-		Description  string `json:"description"`
-		AssetType    string `json:"asset_type" binding:"required"`
-		TotalSupply  int64  `json:"total_supply" binding:"required,gt=0"`
-		OwnerAddress string `json:"owner_address" binding:"required"`
-		ImageURL     string `json:"image_url"`
-		DocumentURL  string `json:"document_url"`
+		IssuerAccount string            `json:"issuer_account" binding:"required"`
+		Name          string            `json:"name" binding:"required"`
+		Symbol        string            `json:"symbol" binding:"required"`
+		Description   string            `json:"description"`
+		AssetType     string            `json:"asset_type" binding:"required"`
+		TotalSupply   int64             `json:"total_supply" binding:"required,gt=0"`
+		Metadata      map[string]string `json:"metadata"`
+		Fractions     uint64            `json:"fractions"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -40,28 +41,60 @@ func (h *AssetHandler) CreateAsset(c *gin.Context) {
 		return
 	}
 
-	// TODO: Deploy smart contract and get contract ID
-	contractID := "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	// Validate Stellar address
+	if err := h.stellarClient.ValidateAddress(req.IssuerAccount); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid issuer account address"})
+		return
+	}
 
+	// Marshal metadata to JSON string
+	metadataJSON, _ := json.Marshal(req.Metadata)
+
+	// Create record in database
 	asset := models.Asset{
 		Name:         req.Name,
 		Symbol:       req.Symbol,
 		Description:  req.Description,
 		AssetType:    req.AssetType,
 		TotalSupply:  req.TotalSupply,
-		ContractID:   contractID,
-		OwnerAddress: req.OwnerAddress,
-		ImageURL:     req.ImageURL,
-		DocumentURL:  req.DocumentURL,
+		Fractions:    req.Fractions,
+		OwnerAddress: req.IssuerAccount,
+		Metadata:     string(metadataJSON),
 		Verified:     false,
 	}
 
 	if err := h.db.Create(&asset).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create asset"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create asset record"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, asset)
+	// Invoke Soroban contract to mint tokens
+	// params: [asset_name, symbol, total_supply, issuer]
+	params := []interface{}{req.Name, req.Symbol, req.TotalSupply, req.IssuerAccount}
+	
+	// TODO: Get contract ID from config or dynamic deployment
+	contractID := "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	
+	txHash, err := h.stellarClient.InvokeContract(contractID, "mint", params)
+	if err != nil {
+		// Log error but the DB record is already created with verified=false
+		// In a production app, we might want to roll back or mark as failed
+		c.JSON(http.StatusAccepted, gin.H{
+			"message": "Asset created in database but contract invocation failed",
+			"asset":   asset,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	// Update asset with contract ID and status if successful
+	h.db.Model(&asset).Update("verified", true)
+
+	c.JSON(http.StatusCreated, gin.H{
+		"message": "Asset tokenized successfully",
+		"asset":   asset,
+		"tx_hash": txHash,
+	})
 }
 
 // ListAssets returns all assets
