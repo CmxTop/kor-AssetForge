@@ -197,8 +197,6 @@ impl Marketplace {
         true
     }
 
-    /// Cancel a listing.
-    /// Blocked if the asset is paused for Trading scope.
     pub fn cancel_listing(
         env: Env,
         seller: Address,
@@ -1005,6 +1003,9 @@ impl Marketplace {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Compliance Reporting Queries
+    // -----------------------------------------------------------------------
     /// Get total tokenized value
     pub fn get_total_tokenized_value(_env: Env, _asset_id: Option<u64>, time_range: Option<TimeRange>) -> Result<i128, ComplianceError> {
         if let Some(range) = time_range {
@@ -1044,10 +1045,10 @@ impl Marketplace {
 mod test {
     use super::*;
     use crate::asset_token::{AssetToken, AssetTokenClient};
-    use crate::emergency_control::EmergencyControl;
+    use crate::emergency_control::{EmergencyControl, EmergencyControlClient, PauseScope};
     use crate::governance::{Governance, GovernanceClient};
     use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::{vec, String};
+    use soroban_sdk::{Address, Env, Vec, String};
 
     #[test]
     fn test_create_listing_when_not_paused() {
@@ -1062,7 +1063,7 @@ mod test {
         // Deploy marketplace contract
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
-
+        mp_client.initialize(&admin); // Initialize marketplace admin
 
         let seller = Address::generate(&env);
         let asset_id = 1;
@@ -1094,6 +1095,7 @@ mod test {
         // Deploy marketplace
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
+        mp_client.initialize(&admin); // Initialize marketplace admin
 
         let seller = Address::generate(&env);
         // This should panic because trading is paused
@@ -1116,6 +1118,7 @@ mod test {
 
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
+        mp_client.initialize(&admin); // Initialize marketplace admin
 
         let buyer = Address::generate(&env);
         mp_client.purchase(&buyer, &1, &50, &1, &ec_id);
@@ -1137,6 +1140,7 @@ mod test {
 
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
+        mp_client.initialize(&admin); // Initialize marketplace admin
 
         let buyer = Address::generate(&env);
         let result = mp_client.purchase(&buyer, &1, &50, &1, &ec_id);
@@ -1166,6 +1170,7 @@ mod test {
             &String::from_str(&env, "GOV"),
             &String::from_str(&env, "GOV"),
             &7,
+            &0,
         );
 
         // Governance
@@ -1192,6 +1197,7 @@ mod test {
         // Now listing should succeed with governance gate
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
+        mp_client.initialize(&admin); // Initialize marketplace admin
         let seller = Address::generate(&env);
 
         let lid = mp_client.create_listing(
@@ -1225,6 +1231,7 @@ mod test {
             &String::from_str(&env, "GOV"),
             &String::from_str(&env, "GOV"),
             &7,
+            &0,
         );
 
         // Governance (no proposals passed)
@@ -1235,6 +1242,7 @@ mod test {
         // Try listing with governance gate — should fail
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
+        mp_client.initialize(&admin); // Initialize marketplace admin
         let seller = Address::generate(&env);
 
         mp_client.create_listing(&seller, &1, &100, &1000, &ec_id, &Some(gov_id));
@@ -1296,7 +1304,7 @@ mod test {
         assert!(mp_client.is_whitelisted(&asset_id, &user1));
 
         // Bulk add
-        let users = vec![&env, user2.clone()];
+        let users = Vec::from_array(&env, [user2.clone()]);
         mp_client.bulk_add_to_whitelist(&admin, &asset_id, &users);
         assert!(mp_client.is_whitelisted(&asset_id, &user2));
 
@@ -1784,11 +1792,11 @@ mod test {
         mp_client.deposit_to_treasury(&admin, &30_000);
         assert!(!mp_client.is_auto_buyback_ready());
 
-        mp_client.deposit_to_treasury(&admin, &25_000);
+        mp_client.deposit_to_treasury(&admin, &25_000); // Total 55,000 >= 50,000
         assert!(mp_client.is_auto_buyback_ready());
 
         // After auto buy-back drains below threshold
-        mp_client.auto_buy_back();
+        mp_client.auto_buy_back(); // 55,000 - 5,000 = 50,000
         assert!(mp_client.is_auto_buyback_ready()); // 50_000 still >= 50_000
 
         // Pause makes it not ready
@@ -1845,7 +1853,7 @@ mod test {
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
 
-        mp_client.initialize(&admin);
+        mp_client.initialize(&admin); // Initialize marketplace admin
         mp_client.initialize_referral(&admin, &treasury, &500, &1000); // 5% reward on fees
 
         let (referrer, reward, count) = mp_client.get_referral_info(&Address::generate(&env));
@@ -1864,7 +1872,7 @@ mod test {
         let referrer = Address::generate(&env);
         let referred = Address::generate(&env);
 
-        mp_client.initialize(&admin);
+        mp_client.initialize(&admin); // Initialize marketplace admin
         mp_client.refer_user(&referred, &referrer);
 
         let (stored_referrer, _reward, _count) = mp_client.get_referral_info(&referred);
@@ -1882,6 +1890,8 @@ mod test {
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
         let user = Address::generate(&env);
+        let admin = Address::generate(&env); // Added for marketplace init
+        mp_client.initialize(&admin); // Initialize marketplace admin
 
         mp_client.refer_user(&user, &user);
     }
@@ -1902,7 +1912,7 @@ mod test {
         let referrer = Address::generate(&env);
         let referred = Address::generate(&env);
 
-        mp_client.initialize(&admin);
+        mp_client.initialize(&admin); // Initialize marketplace admin
         // 5% reward on fees (500 bps), 30 bps marketplace fee
         mp_client.initialize_buyback(&admin, &10000, &50000, &5000, &30, &false);
         mp_client.initialize_referral(&admin, &treasury, &500, &100);
@@ -1930,7 +1940,7 @@ mod test {
         let referrer = Address::generate(&env);
         let referred = Address::generate(&env);
 
-        mp_client.initialize(&admin);
+        mp_client.initialize(&admin); // Initialize marketplace admin
         mp_client.initialize_buyback(&admin, &10000, &50000, &5000, &30, &false);
         mp_client.initialize_referral(&admin, &treasury, &500, &100);
 
@@ -1978,5 +1988,3 @@ mod test {
         client.get_total_tokenized_value(&None, &Some(invalid_range));
     }
 }
-
-
