@@ -8,6 +8,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/yourusername/kor-assetforge/config"
 	"github.com/yourusername/kor-assetforge/handlers"
+	"github.com/yourusername/kor-assetforge/utils"
 )
 
 func main() {
@@ -26,6 +27,16 @@ func main() {
 	stellarClient, err := config.InitStellarClient()
 	if err != nil {
 		log.Fatalf("Failed to initialize Stellar client: %v", err)
+	}
+
+	// Initialize Redis
+	redisURL := os.Getenv("REDIS_URL")
+	redisClient, err := utils.InitRedis(redisURL)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize Redis, continuing without cache: %v", err)
+		redisClient = nil
+	} else {
+		defer redisClient.Close()
 	}
 
 	// Setup router
@@ -48,9 +59,10 @@ func main() {
 	v1 := router.Group("/api/v1")
 	{
 		// Asset routes
-		assetHandler := handlers.NewAssetHandler(db, stellarClient)
+		// Asset routes
+		assetHandler := handlers.NewAssetHandler(db, stellarClient, redisClient)
 		v1.POST("/assets/tokenize", assetHandler.TokenizeAsset)
-		v1.POST("/assets", assetHandler.TokenizeAsset) // Keep old path for compatibility if needed or just replace it
+		v1.POST("/assets", assetHandler.TokenizeAsset) 
 		v1.GET("/assets", assetHandler.ListAssets)
 		v1.GET("/assets/:id", assetHandler.GetAsset)
 
