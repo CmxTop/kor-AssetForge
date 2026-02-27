@@ -1043,11 +1043,12 @@ impl Marketplace {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soroban_sdk::vec;
     use crate::asset_token::{AssetToken, AssetTokenClient};
     use crate::emergency_control::EmergencyControl;
     use crate::governance::{Governance, GovernanceClient};
     use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::{vec, String};
+    use soroban_sdk::String;
 
     #[test]
     fn test_create_listing_when_not_paused() {

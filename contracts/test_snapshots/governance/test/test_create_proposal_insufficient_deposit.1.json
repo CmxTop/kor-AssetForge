@@ -1038,7 +1038,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'insufficient tokens for deposit' from contract function 'Symbol(obj#141)'"
+                  "string": "caught panic 'insufficient tokens for deposit' from contract function 'Symbol(obj#147)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"

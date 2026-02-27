@@ -2674,7 +2674,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'operation blocked: asset is paused' from contract function 'Symbol(obj#461)'"
+                  "string": "caught panic 'operation blocked: asset is paused' from contract function 'Symbol(obj#473)'"
                 },
                 {
                   "u64": 30

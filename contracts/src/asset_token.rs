@@ -1,5 +1,5 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
@@ -41,11 +41,13 @@ pub enum DataKey {
     PendingBridge(BytesN<32>), // bridge_id -> PendingBridge
     UserPendingCount(Address), // rate limit tracker per user
     BridgeNonce,               // monotonic nonce for unique bridge IDs
+    VerifierList,              // Vec<Address> of trusted verifiers
+    VerificationStatus,        // VerificationStatus struct
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracterror]
 #[repr(u32)]
-#[allow(dead_code)]
 pub enum FractionalError {
     UnauthorizedAdmin = 1,
     AlreadyFractionalized = 2,
@@ -55,6 +57,9 @@ pub enum FractionalError {
     InsufficientBalance = 6,
     ArithmeticOverflow = 7,
     InvalidAsset = 8,
+    VerifierFailed = 9,
+    InvalidProof = 10,
+    InsufficientConsensus = 11,
 }
 
 #[derive(Clone)]
@@ -68,6 +73,14 @@ pub struct Asset {
     pub is_fractionalized: bool,
     pub total_fractions: u64,
     pub unit_value: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct VerificationStatus {
+    pub verified: bool,
+    pub timestamp: u64,
+    pub verifiers: Vec<Address>,
 }
 
 #[derive(Clone)]
@@ -164,8 +177,24 @@ impl AssetToken {
         total_value: i128,
         fractions: u64,
         initial_owners: Option<Vec<(Address, u64)>>,
+        proof_data: Option<Bytes>,
     ) -> u64 {
         admin.require_auth();
+
+        // Verification Hook
+        if let Some(proof) = proof_data {
+            if let Err(e) = Self::verify_authenticity(&env, proof) {
+                panic!("verification failed: {:?}", e);
+            }
+        } else {
+            let verifiers = Self::get_verifiers(env.clone());
+            if !verifiers.is_empty() {
+                let status = Self::get_verification_status(env.clone());
+                if status.is_none() || !status.unwrap().verified {
+                    panic!("asset not verified");
+                }
+            }
+        }
         let mut asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("Asset not initialized");
         assert_eq!(asset.owner, admin, "not owner");
         assert!(!asset.is_fractionalized, "already fractionalized");
@@ -202,6 +231,15 @@ impl AssetToken {
 
         let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
         ec_client.require_not_paused(&asset_id, &PauseScope::Minting);
+
+        // Ensure verification for update/additional minting if verifiers active
+        let verifiers = Self::get_verifiers(env.clone());
+        if !verifiers.is_empty() {
+            let status = Self::get_verification_status(env.clone());
+            if status.is_none() || !status.unwrap().verified {
+                panic!("asset not verified");
+            }
+        }
 
         let balance = Self::balance(env.clone(), to.clone());
         env.storage().persistent().set(&DataKey::Balance(to.clone()), &(balance + amount));
@@ -431,6 +469,107 @@ impl AssetToken {
     pub fn get_bridge_config(env: Env) -> Option<BridgeConfig> {
         env.storage().instance().get(&DataKey::BridgeConfig)
     }
+
+    // --- External Verifier Management ---
+
+    pub fn add_verifier(env: Env, admin: Address, verifier: Address) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert!(admin == current_admin, "not admin");
+
+        let mut verifiers: Vec<Address> = env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env));
+        let mut exists = false;
+        for v in verifiers.iter() {
+            if v == verifier {
+                exists = true;
+                break;
+            }
+        }
+        if !exists {
+            verifiers.push_back(verifier);
+            env.storage().instance().set(&DataKey::VerifierList, &verifiers);
+        }
+    }
+
+    pub fn remove_verifier(env: Env, admin: Address, verifier: Address) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert!(admin == current_admin, "not admin");
+
+        let verifiers: Vec<Address> = env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env));
+        let mut new_verifiers = Vec::new(&env);
+        for v in verifiers.iter() {
+            if v != verifier {
+                new_verifiers.push_back(v);
+            }
+        }
+        env.storage().instance().set(&DataKey::VerifierList, &new_verifiers);
+    }
+
+    pub fn get_verifiers(env: Env) -> Vec<Address> {
+        env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env))
+    }
+
+    pub fn get_verification_status(env: Env) -> Option<VerificationStatus> {
+        env.storage().instance().get(&DataKey::VerificationStatus)
+    }
+
+    pub fn manual_verify(env: Env, admin: Address) {
+        admin.require_auth();
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        assert!(admin == current_admin, "not admin");
+
+        let status = VerificationStatus {
+            verified: true,
+            timestamp: env.ledger().timestamp(),
+            verifiers: Vec::new(&env),
+        };
+        env.storage().instance().set(&DataKey::VerificationStatus, &status);
+        env.events().publish((Symbol::new(&env, "authenticity_verified"), Symbol::new(&env, "manual")), env.ledger().timestamp());
+    }
+
+    pub fn verify_asset(env: Env, admin: Address, proof_data: Bytes) -> Result<bool, FractionalError> {
+        admin.require_auth();
+        Self::verify_authenticity(&env, proof_data)
+    }
+
+    fn verify_authenticity(env: &Env, proof_data: Bytes) -> Result<bool, FractionalError> {
+        let verifiers: Vec<Address> = env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env));
+        if verifiers.is_empty() {
+            return Ok(true);
+        }
+
+        let mut success_count = 0;
+        let mut executed_verifiers = Vec::new(env);
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("asset not set");
+
+        for verifier in verifiers.iter() {
+            // env.invoke_contract(&verifier, &Symbol::new(env, "verify"), vec![env, asset.id.into_val(env), proof_data.clone().into_val(env)])
+            // Using a tuple for arguments which is common in Soroban invoke_contract
+            let result: bool = env.invoke_contract(&verifier, &Symbol::new(env, "verify"), (asset.id, proof_data.clone()).into_val(env));
+            
+            if result {
+                success_count += 1;
+                executed_verifiers.push_back(verifier);
+            }
+        }
+
+        // Consensus logic: At least one and majority (simplified)
+        let total = verifiers.len();
+        if success_count > 0 && success_count * 2 >= total {
+            let status = VerificationStatus {
+                verified: true,
+                timestamp: env.ledger().timestamp(),
+                verifiers: executed_verifiers,
+            };
+            env.storage().instance().set(&DataKey::VerificationStatus, &status);
+            env.events().publish((Symbol::new(env, "authenticity_verified"), Symbol::new(env, "consensus")), env.ledger().timestamp());
+            Ok(true)
+        } else {
+            env.events().publish((Symbol::new(env, "verification_failed"), Symbol::new(env, "consensus")), env.ledger().timestamp());
+            Err(FractionalError::VerifierFailed)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -458,7 +597,7 @@ mod test {
         let user1 = Address::generate(&env);
         let mut owners = Vec::new(&env);
         owners.push_back((user1.clone(), 100u64));
-        client.mint_fractional(&admin, &100_000, &1000, &Some(owners));
+        client.mint_fractional(&admin, &100_000, &1000, &Some(owners), &None);
 
         assert_eq!(client.balance(&user1), 10_000);
         assert_eq!(client.total_supply(), 100_000);
@@ -481,5 +620,84 @@ mod test {
         
         assert_eq!(client.balance(&user1), 9_000);
         assert_eq!(client.balance(&pool), 3); // 1000 * 30 / 10000 = 3
+    }
+
+    #[contract]
+    pub struct MockVerifier;
+
+    #[contractimpl]
+    impl MockVerifier {
+        pub fn verify(env: Env, _asset_id: u64, proof_data: Bytes) -> bool {
+            let valid_proof = Bytes::from_array(&env, &[1, 2, 3]);
+            proof_data == valid_proof
+        }
+    }
+
+    #[test]
+    fn test_verifier_management() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let at_id = env.register_contract(None, AssetToken);
+        let client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let verifier = Address::generate(&env);
+        client.add_verifier(&admin, &verifier);
+        assert_eq!(client.get_verifiers().len(), 1);
+
+        client.remove_verifier(&admin, &verifier);
+        assert_eq!(client.get_verifiers().len(), 0);
+    }
+
+    #[test]
+    fn test_verify_success_single() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let at_id = env.register_contract(None, AssetToken);
+        let client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let verifier_id = env.register_contract(None, MockVerifier);
+        client.add_verifier(&admin, &verifier_id);
+
+        let proof = Bytes::from_array(&env, &[1, 2, 3]);
+        client.mint_fractional(&admin, &1000, &10, &None, &Some(proof));
+
+        let status = client.get_verification_status().unwrap();
+        assert!(status.verified);
+    }
+
+    #[test]
+    #[should_panic(expected = "verification failed: VerifierFailed")]
+    fn test_verify_failure_invalid_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let at_id = env.register_contract(None, AssetToken);
+        let client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        let verifier_id = env.register_contract(None, MockVerifier);
+        client.add_verifier(&admin, &verifier_id);
+
+        let proof = Bytes::from_array(&env, &[9, 9, 9]);
+        client.mint_fractional(&admin, &1000, &10, &None, &Some(proof));
+    }
+
+    #[test]
+    fn test_manual_verify_override() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let at_id = env.register_contract(None, AssetToken);
+        let client = AssetTokenClient::new(&env, &at_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
+
+        client.manual_verify(&admin);
+        let status = client.get_verification_status().unwrap();
+        assert!(status.verified);
+        assert_eq!(status.verifiers.len(), 0);
     }
 }

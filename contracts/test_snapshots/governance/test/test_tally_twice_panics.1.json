@@ -2091,7 +2091,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'proposal already finalized' from contract function 'Symbol(obj#405)'"
+                  "string": "caught panic 'proposal already finalized' from contract function 'Symbol(obj#417)'"
                 },
                 {
                   "u64": 1

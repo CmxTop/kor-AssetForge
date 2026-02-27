@@ -1408,7 +1408,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'voting period not ended' from contract function 'Symbol(obj#219)'"
+                  "string": "caught panic 'voting period not ended' from contract function 'Symbol(obj#225)'"
                 },
                 {
                   "u64": 1
