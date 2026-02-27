@@ -1,11 +1,31 @@
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
 use crate::governance::GovernanceClient;
 
-// ============================================================================
-// DATA STRUCTURES
-// ============================================================================
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ComplianceError {
+    InvalidTimeRange = 1,
+    Unauthorized = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeRange {
+    pub start_timestamp: u64,
+    pub end_timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceMetrics {
+    pub total_value: i128,
+    pub volume: i128,
+    pub holders: u32,
+}
+
 
 #[derive(Clone)]
 #[contracttype]
@@ -984,7 +1004,41 @@ impl Marketplace {
             }
         }
     }
+
+    /// Get total tokenized value
+    pub fn get_total_tokenized_value(_env: Env, _asset_id: Option<u64>, time_range: Option<TimeRange>) -> Result<i128, ComplianceError> {
+        if let Some(range) = time_range {
+            if range.start_timestamp > range.end_timestamp {
+                return Err(ComplianceError::InvalidTimeRange);
+            }
+        }
+        // Stub: sum supplies across assets from storage
+        Ok(0)
+    }
+
+    /// Get transaction volume
+    pub fn get_transaction_volume(_env: Env, _asset_id: Option<u64>, time_range: Option<TimeRange>) -> Result<i128, ComplianceError> {
+        if let Some(range) = time_range {
+            if range.start_timestamp > range.end_timestamp {
+                return Err(ComplianceError::InvalidTimeRange);
+            }
+        }
+        // Stub: aggregate transaction volumes
+        Ok(0)
+    }
+
+    /// Get unique holder count
+    pub fn get_holder_count(_env: Env, _asset_id: Option<u64>, time_range: Option<TimeRange>) -> Result<u32, ComplianceError> {
+        if let Some(range) = time_range {
+            if range.start_timestamp > range.end_timestamp {
+                return Err(ComplianceError::InvalidTimeRange);
+            }
+        }
+        // Stub: count unique holders
+        Ok(0)
+    }
 }
+
 
 #[cfg(test)]
 mod test {
@@ -993,13 +1047,12 @@ mod test {
     use crate::emergency_control::EmergencyControl;
     use crate::governance::{Governance, GovernanceClient};
     use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::String;
+    use soroban_sdk::{vec, String};
 
     #[test]
     fn test_create_listing_when_not_paused() {
         let env = Env::default();
         env.mock_all_auths();
-
         // Deploy emergency control contract
         let ec_id = env.register_contract(None, EmergencyControl);
         let ec_client = EmergencyControlClient::new(&env, &ec_id);
@@ -1009,6 +1062,7 @@ mod test {
         // Deploy marketplace contract
         let mp_id = env.register_contract(None, Marketplace);
         let mp_client = MarketplaceClient::new(&env, &mp_id);
+
 
         let seller = Address::generate(&env);
         let asset_id = 1;
@@ -1889,5 +1943,40 @@ mod test {
         let (_, reward, _) = mp_client.get_referral_info(&referrer);
         assert_eq!(reward, 0);
     }
+
+    #[test]
+    fn test_compliance_queries_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, Marketplace);
+        let client = MarketplaceClient::new(&env, &contract_id);
+
+        // Test total tokenized value
+        let total_val = client.get_total_tokenized_value(&None, &None);
+        assert_eq!(total_val, 0);
+
+        // Test transaction volume
+        let volume = client.get_transaction_volume(&None, &None);
+        assert_eq!(volume, 0);
+
+        // Test holder count
+        let holders = client.get_holder_count(&None, &None);
+        assert_eq!(holders, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "HostError: Error(Contract, #1)")]
+    fn test_compliance_queries_invalid_time_range() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, Marketplace);
+        let client = MarketplaceClient::new(&env, &contract_id);
+
+        let invalid_range = TimeRange {
+            start_timestamp: 100,
+            end_timestamp: 50,
+        };
+
+        client.get_total_tokenized_value(&None, &Some(invalid_range));
+    }
 }
+
 
