@@ -1,4 +1,4 @@
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec, vec};
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
 use crate::governance::GovernanceClient;
@@ -20,7 +20,7 @@ pub struct Listing {
 #[derive(Clone)]
 #[contracttype]
 pub enum MarketplaceDataKey {
-    Admin,
+    MarketplaceAdmin,
     AssetPrivate(u64),
     Whitelisted(u64, Address),
 }
@@ -29,18 +29,34 @@ pub enum MarketplaceDataKey {
 #[derive(Clone)]
 #[contracttype]
 pub enum BuyBackDataKey {
-    /// Admin address for buy-back operations
-    Admin,
-    /// Buy-back configuration
-    Config,
-    /// Treasury balance (i128)
-    TreasuryBalance,
-    /// Total tokens burned across all operations (i128)
-    TotalBurned,
-    /// History of buy-back/burn operations
-    History,
-    /// Governance contract address for burn approvals
-    GovernanceContract,
+    BuyBackAdminKey,
+    BuyBackConfigKey,
+    TreasuryBalanceKey,
+    TotalBurnedKey,
+    HistoryKey,
+    GovernanceContractKey,
+}
+
+/// Storage keys for the referral system.
+#[derive(Clone)]
+#[contracttype]
+pub enum ReferralDataKey {
+    ReferralConfigKey,
+    ReferrerKey(Address),
+    RewardBalanceKey(Address),
+    ReferralCountKey(Address),
+}
+
+/// Configuration for the referral system.
+#[derive(Clone)]
+#[contracttype]
+pub struct ReferralConfig {
+    /// Reward percentage in basis points (e.g., 500 = 5% of trade fee)
+    pub reward_bps: u32,
+    /// Address of the treasury from which rewards are paid
+    pub treasury: Address,
+    /// Minimum trade activity (in native asset) requested for referral validity
+    pub min_activity: i128,
 }
 
 /// Configuration for the buy-back and burn system.
@@ -139,7 +155,7 @@ impl Marketplace {
         env: Env,
         buyer: Address,
         _listing_id: u64,
-        _amount: i128,
+        amount: i128,
         asset_id: u64,
         emergency_control_id: Address,
     ) -> bool {
@@ -151,6 +167,12 @@ impl Marketplace {
 
         // Enforce whitelisting if asset is private
         Self::require_whitelisted_if_private(&env, asset_id, &buyer);
+
+        // Collect fee and credit referral reward
+        if env.storage().instance().has(&BuyBackDataKey::BuyBackConfigKey) {
+            let fee = Self::collect_fee(env.clone(), amount);
+            Self::credit_referral_reward(&env, &buyer, fee);
+        }
 
         true
     }
@@ -184,10 +206,10 @@ impl Marketplace {
 
     /// Initialize the marketplace with an admin
     pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&MarketplaceDataKey::Admin) {
+        if env.storage().instance().has(&MarketplaceDataKey::MarketplaceAdmin) {
             panic!("already initialized");
         }
-        env.storage().instance().set(&MarketplaceDataKey::Admin, &admin);
+        env.storage().instance().set(&MarketplaceDataKey::MarketplaceAdmin, &admin);
     }
 
     /// Set an asset as private or public (Admin only)
@@ -233,7 +255,7 @@ impl Marketplace {
     // Helper: Require admin authorization
     fn require_admin(env: &Env, admin: &Address) {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&MarketplaceDataKey::Admin).expect("admin not set");
+        let stored_admin: Address = env.storage().instance().get(&MarketplaceDataKey::MarketplaceAdmin).expect("admin not set");
         if admin != &stored_admin {
             panic!("not authorized: admin only");
         }
@@ -272,7 +294,7 @@ impl Marketplace {
     ) {
         admin.require_auth();
 
-        if env.storage().instance().has(&BuyBackDataKey::Admin) {
+        if env.storage().instance().has(&BuyBackDataKey::BuyBackAdminKey) {
             panic!("buy-back system already initialized");
         }
 
@@ -289,7 +311,7 @@ impl Marketplace {
             panic!("fee basis points must not exceed 10000");
         }
 
-        env.storage().instance().set(&BuyBackDataKey::Admin, &admin);
+        env.storage().instance().set(&BuyBackDataKey::BuyBackAdminKey, &admin);
 
         let config = BuyBackConfig {
             burn_cap,
@@ -302,18 +324,18 @@ impl Marketplace {
 
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::Config, &config);
+            .set(&BuyBackDataKey::BuyBackConfigKey, &config);
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TreasuryBalance, &0i128);
+            .set(&BuyBackDataKey::TreasuryBalanceKey, &0i128);
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TotalBurned, &0i128);
+            .set(&BuyBackDataKey::TotalBurnedKey, &0i128);
 
         let history: Vec<BuyBackRecord> = Vec::new(&env);
         env.storage()
             .persistent()
-            .set(&BuyBackDataKey::History, &history);
+            .set(&BuyBackDataKey::HistoryKey, &history);
 
         env.events().publish(
             (Symbol::new(&env, "buyback_initialized"),),
@@ -343,7 +365,7 @@ impl Marketplace {
         let current: i128 = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::TreasuryBalance)
+            .get(&BuyBackDataKey::TreasuryBalanceKey)
             .unwrap_or(0);
 
         let new_balance = current
@@ -352,7 +374,7 @@ impl Marketplace {
 
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TreasuryBalance, &new_balance);
+            .set(&BuyBackDataKey::TreasuryBalanceKey, &new_balance);
 
         env.events()
             .publish((Symbol::new(&env, "treasury_deposit"), depositor), amount);
@@ -372,7 +394,7 @@ impl Marketplace {
         let config: BuyBackConfig = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Config)
+            .get(&BuyBackDataKey::BuyBackConfigKey)
             .expect("buy-back not configured");
 
         let fee = trade_amount
@@ -384,14 +406,14 @@ impl Marketplace {
             let current: i128 = env
                 .storage()
                 .instance()
-                .get(&BuyBackDataKey::TreasuryBalance)
+                .get(&BuyBackDataKey::TreasuryBalanceKey)
                 .unwrap_or(0);
 
             let new_balance = current.checked_add(fee).expect("treasury balance overflow");
 
             env.storage()
                 .instance()
-                .set(&BuyBackDataKey::TreasuryBalance, &new_balance);
+                .set(&BuyBackDataKey::TreasuryBalanceKey, &new_balance);
 
             env.events()
                 .publish((Symbol::new(&env, "fee_collected"),), (trade_amount, fee));
@@ -436,7 +458,7 @@ impl Marketplace {
         let config: BuyBackConfig = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Config)
+            .get(&BuyBackDataKey::BuyBackConfigKey)
             .expect("buy-back not configured");
 
         // Enforce burn cap
@@ -448,7 +470,7 @@ impl Marketplace {
         let treasury: i128 = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::TreasuryBalance)
+            .get(&BuyBackDataKey::TreasuryBalanceKey)
             .unwrap_or(0);
 
         if treasury < source_funds {
@@ -472,20 +494,20 @@ impl Marketplace {
             .expect("treasury underflow");
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TreasuryBalance, &new_treasury);
+            .set(&BuyBackDataKey::TreasuryBalanceKey, &new_treasury);
 
         // Update total burned
         let total_burned: i128 = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::TotalBurned)
+            .get(&BuyBackDataKey::TotalBurnedKey)
             .unwrap_or(0);
         let new_total_burned = total_burned
             .checked_add(amount)
             .expect("total burned overflow");
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TotalBurned, &new_total_burned);
+            .set(&BuyBackDataKey::TotalBurnedKey, &new_total_burned);
 
         // Record in history
         let record = BuyBackRecord {
@@ -532,7 +554,7 @@ impl Marketplace {
         let config: BuyBackConfig = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Config)
+            .get(&BuyBackDataKey::BuyBackConfigKey)
             .expect("buy-back not configured");
 
         // Enforce burn cap
@@ -554,14 +576,14 @@ impl Marketplace {
         let total_burned: i128 = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::TotalBurned)
+            .get(&BuyBackDataKey::TotalBurnedKey)
             .unwrap_or(0);
         let new_total_burned = total_burned
             .checked_add(amount)
             .expect("total burned overflow");
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TotalBurned, &new_total_burned);
+            .set(&BuyBackDataKey::TotalBurnedKey, &new_total_burned);
 
         // Record in history
         let record = BuyBackRecord {
@@ -594,7 +616,7 @@ impl Marketplace {
         let config: BuyBackConfig = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Config)
+            .get(&BuyBackDataKey::BuyBackConfigKey)
             .expect("buy-back not configured");
 
         if config.auto_threshold <= 0 || config.auto_buyback_amount <= 0 {
@@ -604,7 +626,7 @@ impl Marketplace {
         let treasury: i128 = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::TreasuryBalance)
+            .get(&BuyBackDataKey::TreasuryBalanceKey)
             .unwrap_or(0);
 
         if treasury < config.auto_threshold {
@@ -624,26 +646,26 @@ impl Marketplace {
             .expect("treasury underflow");
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TreasuryBalance, &new_treasury);
+            .set(&BuyBackDataKey::TreasuryBalanceKey, &new_treasury);
 
         // Update total burned
         let total_burned: i128 = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::TotalBurned)
+            .get(&BuyBackDataKey::TotalBurnedKey)
             .unwrap_or(0);
         let new_total_burned = total_burned
             .checked_add(buyback_amount)
             .expect("total burned overflow");
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::TotalBurned, &new_total_burned);
+            .set(&BuyBackDataKey::TotalBurnedKey, &new_total_burned);
 
         // Record in history
         let admin: Address = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Admin)
+            .get(&BuyBackDataKey::BuyBackAdminKey)
             .expect("admin not set");
 
         let record = BuyBackRecord {
@@ -669,10 +691,10 @@ impl Marketplace {
     }
 
     // -----------------------------------------------------------------------
-    // Buy-Back & Burn System – Configuration Management
+    // Buy-Back & Burn System – BBConfiguration Management
     // -----------------------------------------------------------------------
 
-    /// Update the buy-back configuration. Admin only.
+    /// Update the buy-back configuration. BBAdmin only.
     ///
     /// # Arguments
     /// * `admin` – Must be the buy-back admin.
@@ -711,7 +733,7 @@ impl Marketplace {
 
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::Config, &config);
+            .set(&BuyBackDataKey::BuyBackConfigKey, &config);
 
         env.events().publish(
             (Symbol::new(&env, "buyback_config_updated"), admin),
@@ -719,7 +741,7 @@ impl Marketplace {
         );
     }
 
-    /// Set the burn cap. Admin only.
+    /// Set the burn cap. BBAdmin only.
     /// Provides a dedicated function for governance to adjust the burn cap.
     pub fn set_burn_cap(env: Env, admin: Address, new_cap: i128) {
         admin.require_auth();
@@ -732,20 +754,20 @@ impl Marketplace {
         let mut config: BuyBackConfig = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Config)
+            .get(&BuyBackDataKey::BuyBackConfigKey)
             .expect("buy-back not configured");
 
         config.burn_cap = new_cap;
 
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::Config, &config);
+            .set(&BuyBackDataKey::BuyBackConfigKey, &config);
 
         env.events()
             .publish((Symbol::new(&env, "burn_cap_updated"),), new_cap);
     }
 
-    /// Pause or unpause the buy-back system. Admin only.
+    /// Pause or unpause the buy-back system. BBAdmin only.
     pub fn set_buyback_paused(env: Env, admin: Address, paused: bool) {
         admin.require_auth();
         Self::require_buyback_admin(&env, &admin);
@@ -753,14 +775,14 @@ impl Marketplace {
         let mut config: BuyBackConfig = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Config)
+            .get(&BuyBackDataKey::BuyBackConfigKey)
             .expect("buy-back not configured");
 
         config.paused = paused;
 
         env.storage()
             .instance()
-            .set(&BuyBackDataKey::Config, &config);
+            .set(&BuyBackDataKey::BuyBackConfigKey, &config);
 
         env.events()
             .publish((Symbol::new(&env, "buyback_paused"),), paused);
@@ -774,7 +796,7 @@ impl Marketplace {
     pub fn get_treasury_balance(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&BuyBackDataKey::TreasuryBalance)
+            .get(&BuyBackDataKey::TreasuryBalanceKey)
             .unwrap_or(0)
     }
 
@@ -782,26 +804,26 @@ impl Marketplace {
     pub fn get_total_burned(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&BuyBackDataKey::TotalBurned)
+            .get(&BuyBackDataKey::TotalBurnedKey)
             .unwrap_or(0)
     }
 
     /// Get the current buy-back configuration.
     pub fn get_buyback_config(env: Env) -> Option<BuyBackConfig> {
-        env.storage().instance().get(&BuyBackDataKey::Config)
+        env.storage().instance().get(&BuyBackDataKey::BuyBackConfigKey)
     }
 
     /// Get the buy-back operation history.
     pub fn get_buyback_history(env: Env) -> Vec<BuyBackRecord> {
         env.storage()
             .persistent()
-            .get(&BuyBackDataKey::History)
+            .get(&BuyBackDataKey::HistoryKey)
             .unwrap_or(Vec::new(&env))
     }
 
     /// Check whether the auto buy-back threshold has been reached.
     pub fn is_auto_buyback_ready(env: Env) -> bool {
-        let config: Option<BuyBackConfig> = env.storage().instance().get(&BuyBackDataKey::Config);
+        let config: Option<BuyBackConfig> = env.storage().instance().get(&BuyBackDataKey::BuyBackConfigKey);
 
         if let Some(c) = config {
             if c.paused || c.auto_threshold <= 0 {
@@ -810,7 +832,7 @@ impl Marketplace {
             let treasury: i128 = env
                 .storage()
                 .instance()
-                .get(&BuyBackDataKey::TreasuryBalance)
+                .get(&BuyBackDataKey::TreasuryBalanceKey)
                 .unwrap_or(0);
             treasury >= c.auto_threshold
         } else {
@@ -824,7 +846,7 @@ impl Marketplace {
 
     /// Verify that the buy-back system has been initialized.
     fn require_buyback_initialized(env: &Env) {
-        if !env.storage().instance().has(&BuyBackDataKey::Admin) {
+        if !env.storage().instance().has(&BuyBackDataKey::BuyBackAdminKey) {
             panic!("buy-back system not initialized");
         }
     }
@@ -834,7 +856,7 @@ impl Marketplace {
         let stored_admin: Address = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Admin)
+            .get(&BuyBackDataKey::BuyBackAdminKey)
             .expect("buy-back system not initialized");
         if *caller != stored_admin {
             panic!("caller is not buy-back admin");
@@ -846,7 +868,7 @@ impl Marketplace {
         let config: BuyBackConfig = env
             .storage()
             .instance()
-            .get(&BuyBackDataKey::Config)
+            .get(&BuyBackDataKey::BuyBackConfigKey)
             .expect("buy-back not configured");
         if config.paused {
             panic!("buy-back system is paused");
@@ -858,12 +880,109 @@ impl Marketplace {
         let mut history: Vec<BuyBackRecord> = env
             .storage()
             .persistent()
-            .get(&BuyBackDataKey::History)
+            .get(&BuyBackDataKey::HistoryKey)
             .unwrap_or(Vec::new(env));
         history.push_back(record);
         env.storage()
             .persistent()
-            .set(&BuyBackDataKey::History, &history);
+            .set(&BuyBackDataKey::HistoryKey, &history);
+    }
+
+    // -----------------------------------------------------------------------
+    // Referral System Operations
+    // -----------------------------------------------------------------------
+
+    /// Initialize the referral reward system.
+    pub fn initialize_referral(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        reward_bps: u32,
+        min_activity: i128,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        if env.storage().instance().has(&ReferralDataKey::ReferralConfigKey) {
+            panic!("referral system already initialized");
+        }
+
+        if reward_bps > 10_000 {
+            panic!("reward basis points must not exceed 10000");
+        }
+
+        let config = ReferralConfig {
+            reward_bps,
+            treasury,
+            min_activity,
+        };
+
+        env.storage().instance().set(&ReferralDataKey::ReferralConfigKey, &config);
+        env.events().publish((Symbol::new(&env, "referral_initialized"),), (reward_bps, min_activity));
+    }
+
+    /// Link a new user to a referrer.
+    pub fn refer_user(env: Env, referred: Address, referrer: Address) {
+        referred.require_auth();
+
+        if referred == referrer {
+            panic!("self-referral not allowed");
+        }
+
+        if env.storage().persistent().has(&ReferralDataKey::ReferrerKey(referred.clone())) {
+            panic!("user already referred");
+        }
+
+        env.storage().persistent().set(&ReferralDataKey::ReferrerKey(referred.clone()), &referrer);
+        
+        let count: u32 = env.storage().persistent().get(&ReferralDataKey::ReferralCountKey(referrer.clone())).unwrap_or(0);
+        env.storage().persistent().set(&ReferralDataKey::ReferralCountKey(referrer.clone()), &(count + 1));
+
+        env.events().publish((Symbol::new(&env, "referral_set"), referred), referrer);
+    }
+
+    /// Claim accumulated referral rewards.
+    pub fn claim_referral_reward(env: Env, referrer: Address) {
+        referrer.require_auth();
+
+        let reward: i128 = env.storage().persistent().get(&ReferralDataKey::RewardBalanceKey(referrer.clone())).unwrap_or(0);
+        if reward <= 0 {
+            panic!("no reward to claim");
+        }
+
+        let _config: ReferralConfig = env.storage().instance().get(&ReferralDataKey::ReferralConfigKey).expect("referral system not initialized");
+
+        // reset balance before transfer for security
+        env.storage().persistent().set(&ReferralDataKey::RewardBalanceKey(referrer.clone()), &0i128);
+
+        // In a real implementation, we would use a token client to transfer reward from config.treasury to referrer.
+        // For this phase, we emit the event and simulate the state change.
+        env.events().publish((Symbol::new(&env, "reward_claimed"), referrer), reward);
+    }
+
+    /// Query referral status for a user.
+    pub fn get_referral_info(env: Env, user: Address) -> (Option<Address>, i128, u32) {
+        let referrer: Option<Address> = env.storage().persistent().get(&ReferralDataKey::ReferrerKey(user.clone()));
+        let reward: i128 = env.storage().persistent().get(&ReferralDataKey::RewardBalanceKey(user.clone())).unwrap_or(0);
+        let count: u32 = env.storage().persistent().get(&ReferralDataKey::ReferralCountKey(user.clone())).unwrap_or(0);
+        (referrer, reward, count)
+    }
+
+    // Helper to credit referral rewards
+    fn credit_referral_reward(env: &Env, referred: &Address, fee_amount: i128) {
+        if let Some(config) = env.storage().instance().get::<_, ReferralConfig>(&ReferralDataKey::ReferralConfigKey) {
+            if let Some(referrer) = env.storage().persistent().get::<_, Address>(&ReferralDataKey::ReferrerKey(referred.clone())) {
+                let reward = fee_amount
+                    .checked_mul(config.reward_bps as i128)
+                    .expect("reward calculation overflow")
+                    / 10_000;
+
+                if reward > 0 {
+                    let current: i128 = env.storage().persistent().get(&ReferralDataKey::RewardBalanceKey(referrer.clone())).unwrap_or(0);
+                    env.storage().persistent().set(&ReferralDataKey::RewardBalanceKey(referrer.clone()), &(current + reward));
+                    env.events().publish((Symbol::new(env, "referral_reward_credited"), referrer), reward);
+                }
+            }
+        }
     }
 }
 
@@ -1080,7 +1199,7 @@ mod test {
 
         mp_client.initialize(&admin);
         
-        let not_admin = Address::generate(&env);
+        let _not_admin = Address::generate(&env);
         env.mock_all_auths();
         
         // This should pass with admin auth
@@ -1658,4 +1777,117 @@ mod test {
 
         mp_client.buy_back_tokens(&admin, &5_000, &5_000, &None);
     }
+
+    // -----------------------------------------------------------------------
+    // Referral System Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_referral_initialization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        mp_client.initialize(&admin);
+        mp_client.initialize_referral(&admin, &treasury, &500, &1000); // 5% reward on fees
+
+        let (referrer, reward, count) = mp_client.get_referral_info(&Address::generate(&env));
+        assert!(referrer.is_none());
+        assert_eq!(reward, 0);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_refer_user_flow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+        let referrer = Address::generate(&env);
+        let referred = Address::generate(&env);
+
+        mp_client.initialize(&admin);
+        mp_client.refer_user(&referred, &referrer);
+
+        let (stored_referrer, _reward, _count) = mp_client.get_referral_info(&referred);
+        assert_eq!(stored_referrer.unwrap(), referrer);
+
+        let (_, _, count) = mp_client.get_referral_info(&referrer);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "self-referral not allowed")]
+    fn test_refer_self_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let user = Address::generate(&env);
+
+        mp_client.refer_user(&user, &user);
+    }
+
+    #[test]
+    fn test_referral_reward_crediting() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let ec_id = env.register_contract(None, EmergencyControl);
+        let ec_client = EmergencyControlClient::new(&env, &ec_id);
+        let admin = Address::generate(&env);
+        ec_client.initialize(&admin);
+
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let treasury = Address::generate(&env);
+        let referrer = Address::generate(&env);
+        let referred = Address::generate(&env);
+
+        mp_client.initialize(&admin);
+        // 5% reward on fees (500 bps), 30 bps marketplace fee
+        mp_client.initialize_buyback(&admin, &10000, &50000, &5000, &30, &false);
+        mp_client.initialize_referral(&admin, &treasury, &500, &100);
+
+        mp_client.refer_user(&referred, &referrer);
+
+        // Trade of 100,000 -> 300 fee -> 5% of 300 = 15 reward
+        mp_client.purchase(&referred, &1, &100_000, &1, &ec_id);
+
+        let (_, reward, _) = mp_client.get_referral_info(&referrer);
+        assert_eq!(reward, 15);
+    }
+
+    #[test]
+    fn test_claim_referral_reward_flow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        // Setup same as above and then claim
+        let ec_id = env.register_contract(None, EmergencyControl);
+        let mp_id = env.register_contract(None, Marketplace);
+        let mp_client = MarketplaceClient::new(&env, &mp_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let referrer = Address::generate(&env);
+        let referred = Address::generate(&env);
+
+        mp_client.initialize(&admin);
+        mp_client.initialize_buyback(&admin, &10000, &50000, &5000, &30, &false);
+        mp_client.initialize_referral(&admin, &treasury, &500, &100);
+
+        mp_client.refer_user(&referred, &referrer);
+        mp_client.purchase(&referred, &1, &100_000, &1, &ec_id);
+
+        // Claim
+        mp_client.claim_referral_reward(&referrer);
+        
+        let (_, reward, _) = mp_client.get_referral_info(&referrer);
+        assert_eq!(reward, 0);
+    }
 }
+
