@@ -1044,6 +1044,7 @@ impl Marketplace {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soroban_sdk::vec;
     use crate::asset_token::{AssetToken, AssetTokenClient};
     use crate::emergency_control::{EmergencyControl, EmergencyControlClient, PauseScope};
     use crate::governance::{Governance, GovernanceClient};

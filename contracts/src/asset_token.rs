@@ -24,7 +24,6 @@ pub struct FractionalTransferEvent {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-#[allow(dead_code)]
 pub enum FractionalError {
     UnauthorizedAdmin = 1,
     AlreadyFractionalized = 2,
@@ -34,6 +33,9 @@ pub enum FractionalError {
     InsufficientBalance = 6,
     ArithmeticOverflow = 7,
     InvalidAsset = 8,
+    VerifierFailed = 9,
+    InvalidProof = 10,
+    InsufficientConsensus = 11,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,14 @@ pub struct Asset {
     pub is_fractionalized: bool,
     pub total_fractions: u64,
     pub unit_value: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct VerificationStatus {
+    pub verified: bool,
+    pub timestamp: u64,
+    pub verifiers: Vec<Address>,
 }
 
 #[derive(Clone)]
@@ -198,8 +208,24 @@ impl AssetToken {
         total_value: i128,
         fractions: u64,
         initial_owners: Option<Vec<(Address, u64)>>,
+        proof_data: Option<Bytes>,
     ) -> u64 {
         admin.require_auth();
+
+        // Verification Hook
+        if let Some(proof) = proof_data {
+            if let Err(e) = Self::verify_authenticity(&env, proof) {
+                panic!("verification failed: {:?}", e);
+            }
+        } else {
+            let verifiers = Self::get_verifiers(env.clone());
+            if !verifiers.is_empty() {
+                let status = Self::get_verification_status(env.clone());
+                if status.is_none() || !status.unwrap().verified {
+                    panic!("asset not verified");
+                }
+            }
+        }
         let mut asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("Asset not initialized");
         assert_eq!(asset.owner, admin, "not owner");
         assert!(!asset.is_fractionalized, "already fractionalized");
@@ -613,7 +639,7 @@ mod test {
         let user1 = Address::generate(&env);
         let mut owners = Vec::new(&env);
         owners.push_back((user1.clone(), 100u64));
-        client.mint_fractional(&admin, &100_000, &1000, &Some(owners));
+        client.mint_fractional(&admin, &100_000, &1000, &Some(owners), &None);
 
         assert_eq!(client.balance(&user1), 10_000);
         assert_eq!(client.total_supply(), 100_000);
