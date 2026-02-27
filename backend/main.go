@@ -8,6 +8,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/yourusername/kor-assetforge/config"
 	"github.com/yourusername/kor-assetforge/handlers"
+	"github.com/yourusername/kor-assetforge/utils"
 )
 
 func main() {
@@ -26,6 +27,16 @@ func main() {
 	stellarClient, err := config.InitStellarClient()
 	if err != nil {
 		log.Fatalf("Failed to initialize Stellar client: %v", err)
+	}
+
+	// Initialize Redis
+	redisURL := os.Getenv("REDIS_URL")
+	redisClient, err := utils.InitRedis(redisURL)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize Redis, continuing without cache: %v", err)
+		redisClient = nil
+	} else {
+		defer redisClient.Close()
 	}
 
 	// Setup router
@@ -48,7 +59,7 @@ func main() {
 	v1 := router.Group("/api/v1")
 	{
 		// Asset routes
-		assetHandler := handlers.NewAssetHandler(db, stellarClient)
+		assetHandler := handlers.NewAssetHandler(db, stellarClient, redisClient)
 		v1.POST("/assets", assetHandler.CreateAsset)
 		v1.GET("/assets", assetHandler.ListAssets)
 		v1.GET("/assets/:id", assetHandler.GetAsset)
@@ -56,6 +67,10 @@ func main() {
 		// Marketplace routes
 		v1.POST("/marketplace/list", assetHandler.ListAssetForSale)
 		v1.POST("/marketplace/transfer", assetHandler.TransferAsset)
+
+		// Webhook routes
+		webhookHandler := handlers.NewWebhookHandler(db)
+		router.POST("/webhooks/stellar-events", webhookHandler.HandleStellarEvent)
 	}
 
 	// Start server
