@@ -40,7 +40,11 @@ func main() {
 	}
 
 	// Setup router
-	router := gin.Default()
+	router := gin.New() // Use gin.New() instead of gin.Default() to avoid default logger/recovery
+	
+	// Use custom enhanced middleware
+	router.Use(handlers.RequestLogger())
+	router.Use(handlers.GlobalErrorHandler())
 
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
@@ -55,14 +59,17 @@ func main() {
 	v1 := router.Group("/api/v1")
 	{
 		// Asset routes
+		// Asset routes
 		assetHandler := handlers.NewAssetHandler(db, stellarClient, redisClient)
-		v1.POST("/assets", assetHandler.CreateAsset)
+		v1.POST("/assets/tokenize", assetHandler.TokenizeAsset)
+		v1.POST("/assets", assetHandler.TokenizeAsset) 
 		v1.GET("/assets", assetHandler.ListAssets)
 		v1.GET("/assets/:id", assetHandler.GetAsset)
 
 		// Marketplace routes
 		v1.POST("/marketplace/list", assetHandler.ListAssetForSale)
 		v1.POST("/marketplace/transfer", assetHandler.TransferAsset)
+		v1.GET("/transactions", assetHandler.ListTransactions)
 
 		// Webhook routes
 		webhookHandler := handlers.NewWebhookHandler(db)

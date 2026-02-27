@@ -14,8 +14,10 @@ type Asset struct {
 	Description   string         `json:"description"`
 	AssetType     string         `gorm:"not null" json:"asset_type"` // real_estate, art, commodity, etc.
 	TotalSupply   int64          `gorm:"not null" json:"total_supply"`
+	Fractions     uint64         `gorm:"default:0" json:"fractions"`
 	ContractID    string         `gorm:"uniqueIndex" json:"contract_id"`
 	OwnerAddress  string         `gorm:"not null" json:"owner_address"`
+	Metadata      string         `gorm:"type:text" json:"metadata"` // JSON string of map[string]string
 	ImageURL      string         `json:"image_url"`
 	DocumentURL   string         `json:"document_url"`
 	Verified      bool           `gorm:"default:false" json:"verified"`

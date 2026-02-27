@@ -1,6 +1,5 @@
 package handlers
 
-import (
 	"context"
 	"encoding/json"
 	"fmt"
@@ -30,17 +29,17 @@ func NewAssetHandler(db *gorm.DB, stellarClient *utils.StellarClient, redisClien
 	}
 }
 
-// CreateAsset handles asset tokenization
-func (h *AssetHandler) CreateAsset(c *gin.Context) {
+// TokenizeAsset handles formal asset tokenization with Soroban integration
+func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 	var req struct {
-		Name         string `json:"name" binding:"required"`
-		Symbol       string `json:"symbol" binding:"required"`
-		Description  string `json:"description"`
-		AssetType    string `json:"asset_type" binding:"required"`
-		TotalSupply  int64  `json:"total_supply" binding:"required,gt=0"`
-		OwnerAddress string `json:"owner_address" binding:"required"`
-		ImageURL     string `json:"image_url"`
-		DocumentURL  string `json:"document_url"`
+		IssuerAccount string            `json:"issuer_account" binding:"required"`
+		Name          string            `json:"name" binding:"required"`
+		Symbol        string            `json:"symbol" binding:"required"`
+		Description   string            `json:"description"`
+		AssetType     string            `json:"asset_type" binding:"required"`
+		TotalSupply   int64             `json:"total_supply" binding:"required,gt=0"`
+		Metadata      map[string]string `json:"metadata"`
+		Fractions     uint64            `json:"fractions"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -48,24 +47,30 @@ func (h *AssetHandler) CreateAsset(c *gin.Context) {
 		return
 	}
 
-	// TODO: Deploy smart contract and get contract ID
-	contractID := "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	// Validate Stellar address
+	if err := h.stellarClient.ValidateAddress(req.IssuerAccount); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid issuer account address"})
+		return
+	}
 
+	// Marshal metadata to JSON string
+	metadataJSON, _ := json.Marshal(req.Metadata)
+
+	// Create record in database
 	asset := models.Asset{
 		Name:         req.Name,
 		Symbol:       req.Symbol,
 		Description:  req.Description,
 		AssetType:    req.AssetType,
 		TotalSupply:  req.TotalSupply,
-		ContractID:   contractID,
-		OwnerAddress: req.OwnerAddress,
-		ImageURL:     req.ImageURL,
-		DocumentURL:  req.DocumentURL,
+		Fractions:    req.Fractions,
+		OwnerAddress: req.IssuerAccount,
+		Metadata:     string(metadataJSON),
 		Verified:     false,
 	}
 
 	if err := h.db.Create(&asset).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create asset"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create asset record"})
 		return
 	}
 
@@ -77,10 +82,35 @@ func (h *AssetHandler) CreateAsset(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusCreated, asset)
+	// Invoke Soroban contract to mint tokens
+	// params: [asset_name, symbol, total_supply, issuer]
+	params := []interface{}{req.Name, req.Symbol, req.TotalSupply, req.IssuerAccount}
+	
+	// TODO: Get contract ID from config or dynamic deployment
+	contractID := "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	
+	txHash, err := h.stellarClient.InvokeContract(contractID, "mint", params)
+	if err != nil {
+		// Log error but the DB record is already created with verified=false
+		c.JSON(http.StatusAccepted, gin.H{
+			"message": "Asset created in database but contract invocation failed",
+			"asset":   asset,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	// Update asset status if successful
+	h.db.Model(&asset).Update("verified", true)
+
+	c.JSON(http.StatusCreated, gin.H{
+		"message": "Asset tokenized successfully",
+		"asset":   asset,
+		"tx_hash": txHash,
+	})
 }
 
-// ListAssets returns all assets
+// ListAssets returns all assets with pagination
 func (h *AssetHandler) ListAssets(c *gin.Context) {
 	cacheKey := "kor:asset:list:page1"
 
@@ -98,15 +128,24 @@ func (h *AssetHandler) ListAssets(c *gin.Context) {
 	}
 
 	var assets []models.Asset
+	var total int64
+	page, limit := utils.GetPaginationParams(c)
 
-	if err := h.db.Find(&assets).Error; err != nil {
+	if err := utils.Paginate(h.db, page, limit, &total, &assets); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch assets"})
 		return
 	}
 
-	// Save to Redis
-	if h.redisClient != nil {
-		if jsonData, err := json.Marshal(assets); err == nil {
+	paginationRes := utils.Pagination{
+		Limit: limit,
+		Page:  page,
+		Total: total,
+		Data:  assets,
+	}
+
+	// Save to Redis (simplified: only cache page 1 default view for now to match upstream)
+	if h.redisClient != nil && page == 1 {
+		if jsonData, err := json.Marshal(paginationRes); err == nil {
 			ctx := context.Background()
 			if err := h.redisClient.Set(ctx, cacheKey, jsonData, 5*time.Minute).Err(); err != nil {
 				log.Printf("Warning: failed to cache list: %v", err)
@@ -114,7 +153,32 @@ func (h *AssetHandler) ListAssets(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, assets)
+	c.JSON(http.StatusOK, paginationRes)
+}
+
+// ListTransactions returns all transactions with pagination
+func (h *AssetHandler) ListTransactions(c *gin.Context) {
+	var transactions []models.Transaction
+	var total int64
+	page, limit := utils.GetPaginationParams(c)
+
+	// Build query (allow filtering by asset_id if provided)
+	query := h.db.Model(&models.Transaction{}).Order("created_at desc")
+	if assetID := c.Query("asset_id"); assetID != "" {
+		query = query.Where("asset_id = ?", assetID)
+	}
+
+	if err := utils.Paginate(query, page, limit, &total, &transactions); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch transactions"})
+		return
+	}
+
+	c.JSON(http.StatusOK, utils.Pagination{
+		Limit: limit,
+		Page:  page,
+		Total: total,
+		Data:  transactions,
+	})
 }
 
 // GetAsset returns a specific asset
