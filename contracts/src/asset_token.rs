@@ -1,5 +1,5 @@
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 use crate::emergency_control::{EmergencyControlClient, PauseScope};
@@ -22,31 +22,7 @@ pub struct FractionalTransferEvent {
     pub asset_id: u64,
 }
 
-#[derive(Clone)]
-#[contracttype]
-pub enum DataKey {
-    Admin,
-    AssetInfo,
-    Balance(Address),
-    TotalSupply,
-    Oracle,
-    Valuation,
-    ValuationHistory,
-    ValuationConfig,
-    ValuationTimestamps,
-    DividendSchedule(u64), // asset_id -> schedule
-    LastClaim(u64, Address),
-    // Cross-chain bridging keys
-    BridgeConfig,
-    PendingBridge(BytesN<32>), // bridge_id -> PendingBridge
-    UserPendingCount(Address), // rate limit tracker per user
-    BridgeNonce,               // monotonic nonce for unique bridge IDs
-    VerifierList,              // Vec<Address> of trusted verifiers
-    VerificationStatus,        // VerificationStatus struct
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[contracterror]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum FractionalError {
     UnauthorizedAdmin = 1,
@@ -145,12 +121,59 @@ pub struct BridgeConfig {
     pub relayer_pubkey: BytesN<32>,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum StakingError {
+    InsufficientBalance = 1,
+    InsufficientToStake = 2,
+    YieldsNotAvailable = 3,
+    Overflow = 4,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    AssetInfo,
+    Balance(Address),
+    TotalSupply,
+    Oracle,
+    Valuation,
+    ValuationHistory,
+    ValuationConfig,
+    ValuationTimestamps,
+    DividendSchedule(u64), // asset_id -> schedule
+    LastClaim(u64, Address),
+    // Cross-chain bridging keys
+    BridgeConfig,
+    PendingBridge(BytesN<32>), // bridge_id -> PendingBridge
+    UserPendingCount(Address), // rate limit tracker per user
+    BridgeNonce,               // monotonic nonce for unique bridge IDs
+    // Staking keys
+    Asset,
+    Staked(Address),
+    TotalStaked,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct Staked {
+    pub amount: i128,
+    pub start_time: u64,
+    pub accumulated_yields: i128,
+}
+
+const ANNUAL_YIELD_RATE: i128 = 500; // 500 basis points = 5%
+const BASIS_POINTS_DIVISOR: i128 = 10000;
+const SECONDS_IN_YEAR: i128 = 31536000;
+
 #[contract]
 pub struct AssetToken;
 
 #[contractimpl]
 impl AssetToken {
-    pub fn initialize(env: Env, admin: Address, name: String, symbol: String, decimals: u32) {
+    pub fn initialize(env: Env, admin: Address, name: String, symbol: String, decimals: u32, initial_supply: i128) -> u64 {
         if env.storage().instance().has(&DataKey::AssetInfo) {
             panic!("already initialized");
         }
@@ -166,9 +189,17 @@ impl AssetToken {
             total_fractions: 0,
             unit_value: 0,
         };
+
         env.storage().instance().set(&DataKey::AssetInfo, &asset);
+        env.storage().instance().set(&DataKey::Asset, &asset);
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::TotalSupply, &0i128);
+        env.storage().instance().set(&DataKey::TotalSupply, &initial_supply);
+
+        if initial_supply > 0 {
+            env.storage().persistent().set(&DataKey::Balance(admin.clone()), &initial_supply);
+        }
+
+        1 // asset_id
     }
 
     pub fn mint_fractional(
@@ -226,23 +257,15 @@ impl AssetToken {
     }
 
     pub fn mint(env: Env, to: Address, amount: i128, asset_id: u64, emergency_control_id: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
-        admin.require_auth();
+        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("Asset not initialized");
+        asset.owner.require_auth();
 
         let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
         ec_client.require_not_paused(&asset_id, &PauseScope::Minting);
 
-        // Ensure verification for update/additional minting if verifiers active
-        let verifiers = Self::get_verifiers(env.clone());
-        if !verifiers.is_empty() {
-            let status = Self::get_verification_status(env.clone());
-            if status.is_none() || !status.unwrap().verified {
-                panic!("asset not verified");
-            }
-        }
-
-        let balance = Self::balance(env.clone(), to.clone());
-        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(balance + amount));
+        let mut balance = Self::balance(env.clone(), to.clone());
+        balance = balance.checked_add(amount).unwrap();
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &balance);
 
         let supply = Self::total_supply(env.clone());
         env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
@@ -250,23 +273,36 @@ impl AssetToken {
         env.events().publish((Symbol::new(&env, "mint"), to), amount);
     }
 
+    /// Get asset details
+    pub fn get_asset(env: Env) -> Option<Asset> {
+        env.storage().instance().get(&DataKey::AssetInfo)
+    }
+
+    /// Get balance of an address
+    pub fn balance(env: Env, address: Address) -> i128 {
+        env.storage().persistent().get(&DataKey::Balance(address)).unwrap_or(0)
+    }
+
+    /// Transfer tokens between addresses
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128, asset_id: u64, emergency_control_id: Address) {
         from.require_auth();
         let ec_client = EmergencyControlClient::new(&env, &emergency_control_id);
         ec_client.require_not_paused(&asset_id, &PauseScope::Transfers);
 
-        let from_balance = Self::balance(env.clone(), from.clone());
-        assert!(from_balance >= amount, "insufficient balance");
-        
-        env.storage().persistent().set(&DataKey::Balance(from.clone()), &(from_balance - amount));
-        let to_balance = Self::balance(env.clone(), to.clone());
-        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+        let mut from_balance = Self::balance(env.clone(), from.clone());
+        if from_balance < amount {
+            panic!("insufficient balance");
+        }
+
+        let mut to_balance = Self::balance(env.clone(), to.clone());
+
+        from_balance -= amount;
+        to_balance += amount;
+
+        env.storage().persistent().set(&DataKey::Balance(from.clone()), &from_balance);
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &to_balance);
 
         env.events().publish((Symbol::new(&env, "transfer"), from, to), amount);
-    }
-
-    pub fn balance(env: Env, address: Address) -> i128 {
-        env.storage().persistent().get(&DataKey::Balance(address)).unwrap_or(0)
     }
 
     pub fn total_supply(env: Env) -> i128 {
@@ -285,26 +321,11 @@ impl AssetToken {
         env.storage().instance().get::<_, Asset>(&DataKey::AssetInfo).expect("not initialized").decimals
     }
 
-    pub fn get_asset(env: Env) -> Option<Asset> {
-        env.storage().instance().get(&DataKey::AssetInfo)
-    }
-
-    pub fn set_oracle(env: Env, oracle: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Oracle, &oracle);
-    }
-
-    pub fn set_valuation_config(env: Env, min_interval: u64) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::ValuationConfig, &ValuationConfig { min_interval });
-    }
-
     pub fn update_valuation(env: Env, updater: Address, new_value: i128) {
         updater.require_auth();
         let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
         let oracle: Option<Address> = env.storage().instance().get(&DataKey::Oracle);
+
         
         if updater != admin && (oracle.is_none() || updater != oracle.unwrap()) {
             panic!("not authorized");
@@ -328,6 +349,19 @@ impl AssetToken {
 
         env.events().publish((Symbol::new(&env, "valuation_updated"),), new_value);
     }
+
+    pub fn set_oracle(env: Env, oracle: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+    }
+
+    pub fn set_valuation_config(env: Env, min_interval: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::ValuationConfig, &ValuationConfig { min_interval });
+    }
+
 
     pub fn schedule_dividend(env: Env, asset_id: u64, total_dividend: i128, payout_asset: Address, interval: u64) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
@@ -470,112 +504,120 @@ impl AssetToken {
         env.storage().instance().get(&DataKey::BridgeConfig)
     }
 
-    // --- External Verifier Management ---
-
-    pub fn add_verifier(env: Env, admin: Address, verifier: Address) {
-        admin.require_auth();
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
-        assert!(admin == current_admin, "not admin");
-
-        let mut verifiers: Vec<Address> = env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env));
-        let mut exists = false;
-        for v in verifiers.iter() {
-            if v == verifier {
-                exists = true;
-                break;
-            }
+    /// Stake tokens to earn yield
+    pub fn stake_tokens(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        
+        let mut balance = Self::balance(env.clone(), from.clone());
+        if balance < amount {
+            panic!("insufficient balance to stake");
         }
-        if !exists {
-            verifiers.push_back(verifier);
-            env.storage().instance().set(&DataKey::VerifierList, &verifiers);
-        }
-    }
-
-    pub fn remove_verifier(env: Env, admin: Address, verifier: Address) {
-        admin.require_auth();
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
-        assert!(admin == current_admin, "not admin");
-
-        let verifiers: Vec<Address> = env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env));
-        let mut new_verifiers = Vec::new(&env);
-        for v in verifiers.iter() {
-            if v != verifier {
-                new_verifiers.push_back(v);
-            }
-        }
-        env.storage().instance().set(&DataKey::VerifierList, &new_verifiers);
-    }
-
-    pub fn get_verifiers(env: Env) -> Vec<Address> {
-        env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env))
-    }
-
-    pub fn get_verification_status(env: Env) -> Option<VerificationStatus> {
-        env.storage().instance().get(&DataKey::VerificationStatus)
-    }
-
-    pub fn manual_verify(env: Env, admin: Address) {
-        admin.require_auth();
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("admin not set");
-        assert!(admin == current_admin, "not admin");
-
-        let status = VerificationStatus {
-            verified: true,
-            timestamp: env.ledger().timestamp(),
-            verifiers: Vec::new(&env),
-        };
-        env.storage().instance().set(&DataKey::VerificationStatus, &status);
-        env.events().publish((Symbol::new(&env, "authenticity_verified"), Symbol::new(&env, "manual")), env.ledger().timestamp());
-    }
-
-    pub fn verify_asset(env: Env, admin: Address, proof_data: Bytes) -> Result<bool, FractionalError> {
-        admin.require_auth();
-        Self::verify_authenticity(&env, proof_data)
-    }
-
-    fn verify_authenticity(env: &Env, proof_data: Bytes) -> Result<bool, FractionalError> {
-        let verifiers: Vec<Address> = env.storage().instance().get(&DataKey::VerifierList).unwrap_or(Vec::new(&env));
-        if verifiers.is_empty() {
-            return Ok(true);
-        }
-
-        let mut success_count = 0;
-        let mut executed_verifiers = Vec::new(env);
-        let asset: Asset = env.storage().instance().get(&DataKey::AssetInfo).expect("asset not set");
-
-        for verifier in verifiers.iter() {
-            // env.invoke_contract(&verifier, &Symbol::new(env, "verify"), vec![env, asset.id.into_val(env), proof_data.clone().into_val(env)])
-            // Using a tuple for arguments which is common in Soroban invoke_contract
-            let result: bool = env.invoke_contract(&verifier, &Symbol::new(env, "verify"), (asset.id, proof_data.clone()).into_val(env));
+        
+        let mut staked_data = env.storage().persistent()
+            .get::<DataKey, Staked>(&DataKey::Staked(from.clone()))
+            .unwrap_or(Staked {
+                amount: 0,
+                start_time: env.ledger().timestamp(),
+                accumulated_yields: 0,
+            });
             
-            if result {
-                success_count += 1;
-                executed_verifiers.push_back(verifier);
-            }
+        // If already staking, update yield before adding more
+        if staked_data.amount > 0 {
+            staked_data.accumulated_yields += Self::calculate_yield(&env, &staked_data);
         }
+        
+        staked_data.amount += amount;
+        staked_data.start_time = env.ledger().timestamp();
+        
+        balance -= amount;
+        
+        env.storage().persistent().set(&DataKey::Balance(from.clone()), &balance);
+        env.storage().persistent().set(&DataKey::Staked(from.clone()), &staked_data);
+        
+        let mut total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        total_staked += amount;
+        env.storage().instance().set(&DataKey::TotalStaked, &total_staked);
+        
+        env.events().publish((Symbol::new(&env, "tokens_staked"), from), amount);
+    }
 
-        // Consensus logic: At least one and majority (simplified)
-        let total = verifiers.len();
-        if success_count > 0 && success_count * 2 >= total {
-            let status = VerificationStatus {
-                verified: true,
-                timestamp: env.ledger().timestamp(),
-                verifiers: executed_verifiers,
-            };
-            env.storage().instance().set(&DataKey::VerificationStatus, &status);
-            env.events().publish((Symbol::new(env, "authenticity_verified"), Symbol::new(env, "consensus")), env.ledger().timestamp());
-            Ok(true)
-        } else {
-            env.events().publish((Symbol::new(env, "verification_failed"), Symbol::new(env, "consensus")), env.ledger().timestamp());
-            Err(FractionalError::VerifierFailed)
+    /// Unstake tokens and claim yields
+    pub fn unstake_tokens(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        
+        let mut staked_data = env.storage().persistent()
+            .get::<DataKey, Staked>(&DataKey::Staked(from.clone()))
+            .unwrap_or_else(|| panic!("no staked tokens found"));
+            
+        if staked_data.amount < amount {
+            panic!("insufficient staked amount");
         }
+        
+        let yield_earned = Self::calculate_yield(&env, &staked_data);
+        let total_yield = staked_data.accumulated_yields + yield_earned;
+        
+        staked_data.amount -= amount;
+        staked_data.accumulated_yields = 0; // Yield claimed
+        staked_data.start_time = env.ledger().timestamp();
+        
+        let mut balance = Self::balance(env.clone(), from.clone());
+        balance += amount + total_yield;
+        
+        env.storage().persistent().set(&DataKey::Balance(from.clone()), &balance);
+        
+        if staked_data.amount == 0 {
+            env.storage().persistent().remove(&DataKey::Staked(from.clone()));
+        } else {
+            env.storage().persistent().set(&DataKey::Staked(from.clone()), &staked_data);
+        }
+        
+        let mut total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
+        total_staked -= amount;
+        env.storage().instance().set(&DataKey::TotalStaked, &total_staked);
+        
+        env.events().publish((Symbol::new(&env, "yields_claimed"), from), total_yield);
+    }
+    
+    pub fn get_staked(env: Env, address: Address) -> Option<Staked> {
+        env.storage().persistent().get(&DataKey::Staked(address))
+    }
+
+    fn calculate_yield(env: &Env, staked: &Staked) -> i128 {
+        let current_time = env.ledger().timestamp();
+        let elapsed = (current_time - staked.start_time) as i128;
+        
+        if elapsed <= 0 || staked.amount <= 0 {
+            return 0;
+        }
+        
+        // yield = (staked_amount * rate * time) / (year_seconds * basis_points_divisor)
+        (staked.amount * ANNUAL_YIELD_RATE * elapsed) / (SECONDS_IN_YEAR * BASIS_POINTS_DIVISOR)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    fn setup(env: &Env) -> (AssetTokenClient<'_>, Address, Address) {
+        let at_id = env.register_contract(None, AssetToken);
+        let client = AssetTokenClient::new(&env, &at_id);
+        
+        let ec_addr = env.register_contract(None, crate::emergency_control::EmergencyControl);
+        let ec_client = crate::emergency_control::EmergencyControlClient::new(&env, &ec_addr);
+        
+        let admin = Address::generate(&env);
+        ec_client.initialize(&admin);
+        
+        let name = String::from_str(&env, "Real Estate Token");
+        let symbol = String::from_str(&env, "RET");
+        let supply = 1_000_000;
+        
+        client.initialize(&admin, &name, &symbol, &7, &supply);
+        (client, admin, ec_addr)
+    }
+
 
     #[test]
     fn test_lifecycle() {
@@ -588,7 +630,7 @@ mod test {
         let admin = Address::generate(&env);
         let name = String::from_str(&env, "Test Asset");
         let symbol = String::from_str(&env, "TSTA");
-        client.initialize(&admin, &name, &symbol, &7);
+        client.initialize(&admin, &name, &symbol, &7, &0);
 
         assert_eq!(client.name(), name);
         assert_eq!(client.symbol(), symbol);
@@ -622,82 +664,99 @@ mod test {
         assert_eq!(client.balance(&pool), 3); // 1000 * 30 / 10000 = 3
     }
 
-    #[contract]
-    pub struct MockVerifier;
-
-    #[contractimpl]
-    impl MockVerifier {
-        pub fn verify(env: Env, _asset_id: u64, proof_data: Bytes) -> bool {
-            let valid_proof = Bytes::from_array(&env, &[1, 2, 3]);
-            proof_data == valid_proof
-        }
+    #[test]
+    fn test_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, ec_id) = setup(&env);
+        let user = Address::generate(&env);
+        
+        client.transfer(&admin, &user, &1000, &1, &ec_id);
+        assert_eq!(client.balance(&admin), 999_000);
+        assert_eq!(client.balance(&user), 1000);
     }
 
     #[test]
-    fn test_verifier_management() {
+    fn test_staking_and_yield() {
         let env = Env::default();
         env.mock_all_auths();
-        let at_id = env.register_contract(None, AssetToken);
-        let client = AssetTokenClient::new(&env, &at_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
-
-        let verifier = Address::generate(&env);
-        client.add_verifier(&admin, &verifier);
-        assert_eq!(client.get_verifiers().len(), 1);
-
-        client.remove_verifier(&admin, &verifier);
-        assert_eq!(client.get_verifiers().len(), 0);
+        let (client, admin, ec_id) = setup(&env);
+        let user = Address::generate(&env);      
+        client.transfer(&admin, &user, &10_000, &1, &ec_id);
+        
+        // Stake 10,000 tokens
+        client.stake_tokens(&user, &10_000);
+        assert_eq!(client.balance(&user), 0);
+        
+        let staked = client.get_staked(&user).unwrap();
+        assert_eq!(staked.amount, 10_000);
+        
+        // Jump 1 year forward (31,536,000 seconds)
+        env.ledger().with_mut(|li| {
+            li.timestamp += 31_536_000;
+        });
+        
+        // Unstake all
+        client.unstake_tokens(&user, &10_000);
+        
+        // 5% yield on 10,000 = 500
+        assert_eq!(client.balance(&user), 10_500);
     }
 
     #[test]
-    fn test_verify_success_single() {
+    fn test_accumulated_yield() {
         let env = Env::default();
         env.mock_all_auths();
-        let at_id = env.register_contract(None, AssetToken);
-        let client = AssetTokenClient::new(&env, &at_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
-
-        let verifier_id = env.register_contract(None, MockVerifier);
-        client.add_verifier(&admin, &verifier_id);
-
-        let proof = Bytes::from_array(&env, &[1, 2, 3]);
-        client.mint_fractional(&admin, &1000, &10, &None, &Some(proof));
-
-        let status = client.get_verification_status().unwrap();
-        assert!(status.verified);
+        let (client, admin, ec_id) = setup(&env);
+        let user = Address::generate(&env);      
+        client.transfer(&admin, &user, &20_000, &1, &ec_id);
+        
+        // Stake 10,000 tokens
+        client.stake_tokens(&user, &10_000);
+        
+        // Jump 6 months
+        env.ledger().with_mut(|li| {
+            li.timestamp += 15_768_000;
+        });
+        
+        // Stake another 10,000 tokens. This should trigger yield calculation for the first stake.
+        client.stake_tokens(&user, &10_000);
+        
+        let staked = client.get_staked(&user).unwrap();
+        assert_eq!(staked.amount, 20_000);
+        // 5% yield for 6 months on 10,000 = 250
+        assert_eq!(staked.accumulated_yields, 250);
+        
+        // Jump another 6 months
+        env.ledger().with_mut(|li| {
+            li.timestamp += 15_768_000;
+        });
+        
+        // Total yield should be:
+        // 250 (accumulated) + (20,000 * 0.05 * 0.5 year) = 250 + 500 = 750
+        client.unstake_tokens(&user, &20_000);
+        assert_eq!(client.balance(&user), 20_750);
     }
 
     #[test]
-    #[should_panic(expected = "verification failed: VerifierFailed")]
-    fn test_verify_failure_invalid_proof() {
+    #[should_panic(expected = "insufficient balance to stake")]
+    fn test_stake_insufficient_balance() {
         let env = Env::default();
         env.mock_all_auths();
-        let at_id = env.register_contract(None, AssetToken);
-        let client = AssetTokenClient::new(&env, &at_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
-
-        let verifier_id = env.register_contract(None, MockVerifier);
-        client.add_verifier(&admin, &verifier_id);
-
-        let proof = Bytes::from_array(&env, &[9, 9, 9]);
-        client.mint_fractional(&admin, &1000, &10, &None, &Some(proof));
+        let (client, _admin, _ec_id) = setup(&env);
+        let user = Address::generate(&env);
+        
+        client.stake_tokens(&user, &100);
     }
 
     #[test]
-    fn test_manual_verify_override() {
+    #[should_panic(expected = "insufficient staked amount")]
+    fn test_unstake_insufficient() {
         let env = Env::default();
         env.mock_all_auths();
-        let at_id = env.register_contract(None, AssetToken);
-        let client = AssetTokenClient::new(&env, &at_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &String::from_str(&env, "T"), &String::from_str(&env, "T"), &7);
-
-        client.manual_verify(&admin);
-        let status = client.get_verification_status().unwrap();
-        assert!(status.verified);
-        assert_eq!(status.verifiers.len(), 0);
+        let (client, admin, _ec_id) = setup(&env);
+        
+        client.stake_tokens(&admin, &1000);
+        client.unstake_tokens(&admin, &2000);
     }
 }

@@ -49,6 +49,7 @@ mod tests {
             &String::from_str(&env, "Token"),
             &String::from_str(&env, "TKN"),
             &7,
+            &0,
         );
 
         // Initialize governance: quorum=100, deposit=50

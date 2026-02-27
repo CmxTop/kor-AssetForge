@@ -426,6 +426,7 @@ mod test {
             &String::from_str(&env, "GovToken"),
             &String::from_str(&env, "GOV"),
             &7,
+            &0,
         );
 
         // Governance contract
