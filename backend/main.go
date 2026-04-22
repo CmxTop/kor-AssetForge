@@ -3,11 +3,14 @@ package main
 import (
 	"log"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"github.com/yourusername/kor-assetforge/config"
 	"github.com/yourusername/kor-assetforge/handlers"
+	"github.com/yourusername/kor-assetforge/middleware"
+	"github.com/yourusername/kor-assetforge/validator"
 	"github.com/yourusername/kor-assetforge/utils"
 )
 
@@ -41,10 +44,20 @@ func main() {
 
 	// Setup router
 	router := gin.New() // Use gin.New() instead of gin.Default() to avoid default logger/recovery
-	
+
+	if err := validator.Init(); err != nil {
+		log.Fatalf("Failed to initialize validator: %v", err)
+	}
+
 	// Use custom enhanced middleware
-	router.Use(handlers.RequestLogger())
-	router.Use(handlers.GlobalErrorHandler())
+	router.Use(
+		handlers.RequestLogger(),
+		handlers.GlobalErrorHandler(),
+		middleware.RequestSizeLimiter(2<<20),
+		middleware.RequireJSON(),
+		middleware.RateLimit(20, time.Minute),
+		middleware.CSRFProtection(os.Getenv("CSRF_SECRET")),
+	)
 
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
