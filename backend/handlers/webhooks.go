@@ -1,11 +1,11 @@
 package handlers
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -49,7 +49,7 @@ func (h *WebhookHandler) HandleStellarEvent(c *gin.Context) {
 			return
 		}
 		// Reset body for binding
-		c.Request.Body = io.NopCloser(json.RawMessage(body))
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
 	var event StellarEvent
