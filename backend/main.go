@@ -8,6 +8,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
+	"github.com/ulule/limiter/v3"
+	_ "github.com/yourusername/kor-assetforge/docs"
 	"github.com/yourusername/kor-assetforge/config"
 	"github.com/yourusername/kor-assetforge/handlers"
 	"github.com/yourusername/kor-assetforge/middleware"
@@ -16,6 +21,20 @@ import (
 	"github.com/yourusername/kor-assetforge/validator"
 )
 
+// @title kor-AssetForge API
+// @version 0.1.0
+// @description Decentralized marketplace for tokenizing and trading real-world assets on Stellar.
+// @termsOfService http://swagger.io/terms/
+
+// @contact.name API Support
+// @contact.url http://www.swagger.io/support
+// @contact.email support@swagger.io
+
+// @license.name MIT
+// @license.url https://opensource.org/licenses/MIT
+
+// @host localhost:8080
+// @BasePath /api/v1
 func main() {
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
@@ -49,6 +68,19 @@ func main() {
 
 	// Warm common cache entries on startup
 	go cacheManager.Warm(context.Background(), config.WarmCacheEntries(db))
+	// Initialize Rate Limiter (e.g., 100 requests per minute)
+	var rateLimiterMiddleware gin.HandlerFunc
+	if redisClient != nil {
+		rl, err := handlers.NewRateLimiter(redisClient, limiter.Rate{
+			Period: time.Minute,
+			Limit:  100,
+		})
+		if err != nil {
+			log.Printf("Warning: Failed to initialize rate limiter: %v", err)
+		} else {
+			rateLimiterMiddleware = rl.Middleware()
+		}
+	}
 
 	// Setup router
 	router := gin.New()
@@ -67,14 +99,23 @@ func main() {
 		middleware.CSRFProtection(os.Getenv("CSRF_SECRET")),
 	)
 
-	// Health check endpoint
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status":  "healthy",
-			"service": "kor-AssetForge API",
-			"version": "0.1.0",
-		})
-	})
+	// Health check handlers
+	healthHandler := handlers.NewHealthHandler(db, redisClient, stellarClient)
+	router.GET("/health", healthHandler.LivenessCheck)
+	router.GET("/health/ready", healthHandler.ReadinessCheck)
+	router.GET("/health/live", healthHandler.LivenessCheck)
+
+	// Metrics endpoint
+	// @Summary Prometheus metrics
+	// @Description Get service metrics in Prometheus format
+	// @Tags monitoring
+	// @Produce plain
+	// @Success 200 {string} string "Prometheus metrics"
+	// @Router /metrics [get]
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
+	// Swagger documentation
+	router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	// Cache metrics
 	router.GET("/metrics/cache", middleware.CacheMetricsHandler(cacheManager))
@@ -83,6 +124,7 @@ func main() {
 	v1 := router.Group("/api/v1")
 	{
 		// Asset routes (with write-through cache invalidation)
+		// Asset routes
 		assetHandler := handlers.NewAssetHandler(db, stellarClient, redisClient)
 		v1.POST("/assets/tokenize",
 			middleware.InvalidateOnWrite(cacheManager, "kor:asset:*"),
