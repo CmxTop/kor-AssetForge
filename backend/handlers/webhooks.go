@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yourusername/kor-assetforge/models"
+	"github.com/yourusername/kor-assetforge/validator"
 	"gorm.io/gorm"
 )
 
@@ -26,14 +27,14 @@ func NewWebhookHandler(db *gorm.DB) *WebhookHandler {
 
 // StellarEvent represents the payload from Stellar Horizon events
 type StellarEvent struct {
-	ID          string          `json:"id"`
-	PagingToken string          `json:"paging_token"`
-	Type        string          `json:"type"`
-	ContractID  string          `json:"contract_id"`
-	Topic       []string        `json:"topic"`
-	Value       json.RawMessage `json:"value"`
-	Ledger      int32           `json:"ledger"`
-	CreatedAt   string          `json:"created_at"`
+	ID          string          `json:"id" binding:"required,no_html"`
+	PagingToken string          `json:"paging_token" binding:"required,no_html"`
+	Type        string          `json:"type" binding:"required,no_html"`
+	ContractID  string          `json:"contract_id" binding:"required,no_html"`
+	Topic       []string        `json:"topic" binding:"required,dive,no_html"`
+	Value       json.RawMessage `json:"value" binding:"required"`
+	Ledger      int32           `json:"ledger" binding:"required"`
+	CreatedAt   string          `json:"created_at" binding:"required,no_html"`
 }
 
 // HandleStellarEvent processes events received from Stellar Horizon
@@ -67,6 +68,8 @@ func (h *WebhookHandler) HandleStellarEvent(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid event payload"})
 		return
 	}
+
+	validator.SanitizeStruct(&event)
 
 	// 2. Idempotency Check
 	// In a real app, we would store event IDs in a separate table
