@@ -12,6 +12,7 @@ type User struct {
 	StellarAddress  string         `gorm:"uniqueIndex;not null" json:"stellar_address"`
 	Email           string         `gorm:"uniqueIndex" json:"email"`
 	Username        string         `gorm:"uniqueIndex" json:"username"`
+	Role            string         `gorm:"default:'user'" json:"role"` // 'user' or 'admin'
 	KYCVerified     bool           `gorm:"default:false" json:"kyc_verified"`
 	AccreditedInvestor bool        `gorm:"default:false" json:"accredited_investor"`
 	CreatedAt       time.Time      `json:"created_at"`
