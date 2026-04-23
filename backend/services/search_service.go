@@ -100,16 +100,17 @@ func (s *DBSearchBackend) Search(ctx context.Context, req *SearchRequest) (*Sear
 		q = q.Where("verified = ?", *req.Verified)
 	}
 
-	// Price range via JOIN with active listings
+	// Price range via subquery on active listings — avoids duplicate rows from JOIN
 	if req.MinPrice != nil || req.MaxPrice != nil {
-		q = q.Joins("JOIN listings ON listings.asset_id = assets.id AND listings.deleted_at IS NULL AND listings.active = true")
+		subQ := s.db.Model(&models.Listing{}).Select("asset_id").
+			Where("active = ? AND deleted_at IS NULL", true)
 		if req.MinPrice != nil {
-			q = q.Where("listings.price_per_unit >= ?", *req.MinPrice)
+			subQ = subQ.Where("price_per_unit >= ?", *req.MinPrice)
 		}
 		if req.MaxPrice != nil {
-			q = q.Where("listings.price_per_unit <= ?", *req.MaxPrice)
+			subQ = subQ.Where("price_per_unit <= ?", *req.MaxPrice)
 		}
-		q = q.Distinct("assets.*")
+		q = q.Where("id IN (?)", subQ)
 	}
 
 	// Count before pagination
@@ -164,17 +165,19 @@ func (s *DBSearchBackend) Suggest(ctx context.Context, query string, limit int) 
 	if limit <= 0 || limit > 20 {
 		limit = 10
 	}
-	like := strings.TrimSpace(query) + "%"
-	if like == "%" {
+	term := strings.TrimSpace(query)
+	if term == "" {
 		return &SuggestResult{Suggestions: []string{}}, nil
 	}
+	like := term + "%"
 
+	// Raw SQL with DISTINCT avoids GORM ambiguity and works across all drivers.
 	type row struct{ Name string }
 	var names []row
-	s.db.WithContext(ctx).Model(&models.Asset{}).
-		Select("DISTINCT name").
-		Where("name ILIKE ? OR symbol ILIKE ?", like, like).
-		Limit(limit).Scan(&names)
+	s.db.WithContext(ctx).
+		Raw("SELECT DISTINCT name FROM assets WHERE deleted_at IS NULL AND (name ILIKE ? OR symbol ILIKE ?) LIMIT ?",
+			like, like, limit).
+		Scan(&names)
 
 	suggestions := make([]string, 0, len(names))
 	for _, r := range names {
