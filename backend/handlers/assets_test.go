@@ -2,26 +2,42 @@ package handlers
 
 import (
 	"testing"
+
+	"github.com/yourusername/kor-assetforge/validator"
 )
 
-// TODO: Add comprehensive tests for asset handlers
-// - Test CreateAsset with valid/invalid inputs
-// - Test ListAssets pagination
-// - Test GetAsset with existing/non-existing IDs
-// - Test ListAssetForSale validation
-// - Test TransferAsset authorization
+func TestTokenizeAssetRequestValidation(t *testing.T) {
+	if err := validator.Init(); err != nil {
+		t.Fatalf("failed to initialize validator: %v", err)
+	}
 
-func TestCreateAsset(t *testing.T) {
-	// Placeholder test
-	t.Skip("Implement asset creation tests")
+	req := validator.TokenizeAssetRequest{
+		IssuerAccount: "GD6WU5I6OIPRZ4A5I3G6JQ4RG5K27SQ26WPQ5W3MXV6QABBT3C7FIEIF",
+		Name:          "Real Asset",
+		Symbol:        "RWA1",
+		AssetType:     "real_estate",
+		TotalSupply:   1000,
+	}
+
+	if err := validator.ValidateStruct(&req); err != nil {
+		t.Fatalf("expected valid request to pass validation: %v", err)
+	}
 }
 
-func TestListAssets(t *testing.T) {
-	// Placeholder test
-	t.Skip("Implement asset listing tests")
-}
+func TestTokenizeAssetRequestRejectsInvalidIssuer(t *testing.T) {
+	if err := validator.Init(); err != nil {
+		t.Fatalf("failed to initialize validator: %v", err)
+	}
 
-func TestTransferAsset(t *testing.T) {
-	// Placeholder test
-	t.Skip("Implement asset transfer tests")
+	req := validator.TokenizeAssetRequest{
+		IssuerAccount: "INVALIDADDRESS",
+		Name:          "Real Asset",
+		Symbol:        "RWA1",
+		AssetType:     "real_estate",
+		TotalSupply:   1000,
+	}
+
+	if err := validator.ValidateStruct(&req); err == nil {
+		t.Fatal("expected invalid issuer address to fail validation")
+	}
 }
