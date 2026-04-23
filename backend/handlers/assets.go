@@ -31,6 +31,16 @@ func NewAssetHandler(db *gorm.DB, stellarClient *utils.StellarClient, redisClien
 }
 
 // TokenizeAsset handles formal asset tokenization with Soroban integration
+// @Summary Tokenize a new asset
+// @Description Create a new fractionalized asset on the Stellar network
+// @Tags assets
+// @Accept json
+// @Produce json
+// @Param asset body object true "Asset creation details"
+// @Success 201 {object} models.Asset
+// @Failure 400 {object} map[string]interface{}
+// @Failure 500 {object} map[string]interface{}
+// @Router /assets/tokenize [post]
 func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 	var req struct {
 		IssuerAccount string            `json:"issuer_account" binding:"required"`
@@ -112,6 +122,16 @@ func (h *AssetHandler) TokenizeAsset(c *gin.Context) {
 }
 
 // ListAssets returns all assets with pagination
+// @Summary List all assets
+// @Description Get a paginated list of all tokenized assets
+// @Tags assets
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Page size" default(10)
+// @Success 200 {object} utils.Pagination
+// @Failure 500 {object} map[string]interface{}
+// @Router /assets [get]
 func (h *AssetHandler) ListAssets(c *gin.Context) {
 	cacheKey := "kor:asset:list:page1"
 
@@ -132,16 +152,10 @@ func (h *AssetHandler) ListAssets(c *gin.Context) {
 	var total int64
 	page, limit := utils.GetPaginationParams(c)
 
-	if err := utils.Paginate(h.db, page, limit, &total, &assets); err != nil {
+	paginationRes, err := utils.Paginate(h.db, c, page, limit, &total, &assets)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch assets"})
 		return
-	}
-
-	paginationRes := utils.Pagination{
-		Limit: limit,
-		Page:  page,
-		Total: total,
-		Data:  assets,
 	}
 
 	// Save to Redis (simplified: only cache page 1 default view for now to match upstream)
@@ -158,6 +172,17 @@ func (h *AssetHandler) ListAssets(c *gin.Context) {
 }
 
 // ListTransactions returns all transactions with pagination
+// @Summary List transactions
+// @Description Get a paginated list of all asset transactions
+// @Tags marketplace
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Page size" default(10)
+// @Param asset_id query int false "Filter by asset ID"
+// @Success 200 {object} utils.Pagination
+// @Failure 500 {object} map[string]interface{}
+// @Router /transactions [get]
 func (h *AssetHandler) ListTransactions(c *gin.Context) {
 	var transactions []models.Transaction
 	var total int64
@@ -169,20 +194,25 @@ func (h *AssetHandler) ListTransactions(c *gin.Context) {
 		query = query.Where("asset_id = ?", assetID)
 	}
 
-	if err := utils.Paginate(query, page, limit, &total, &transactions); err != nil {
+	paginationRes, err := utils.Paginate(query, c, page, limit, &total, &transactions)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch transactions"})
 		return
 	}
 
-	c.JSON(http.StatusOK, utils.Pagination{
-		Limit: limit,
-		Page:  page,
-		Total: total,
-		Data:  transactions,
-	})
+	c.JSON(http.StatusOK, paginationRes)
 }
 
 // GetAsset returns a specific asset
+// @Summary Get asset details
+// @Description Get detailed information about a specific asset by its ID
+// @Tags assets
+// @Accept json
+// @Produce json
+// @Param id path int true "Asset ID"
+// @Success 200 {object} models.Asset
+// @Failure 404 {object} map[string]interface{}
+// @Router /assets/{id} [get]
 func (h *AssetHandler) GetAsset(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseUint(idStr, 10, 32)
@@ -226,6 +256,16 @@ func (h *AssetHandler) GetAsset(c *gin.Context) {
 }
 
 // ListAssetForSale creates a marketplace listing
+// @Summary List asset for sale
+// @Description Create a new marketplace listing for a tokenized asset
+// @Tags marketplace
+// @Accept json
+// @Produce json
+// @Param listing body object true "Listing details"
+// @Success 201 {object} models.Listing
+// @Failure 400 {object} map[string]interface{}
+// @Failure 500 {object} map[string]interface{}
+// @Router /marketplace/list [post]
 func (h *AssetHandler) ListAssetForSale(c *gin.Context) {
 	var req struct {
 		AssetID      uint   `json:"asset_id" binding:"required"`
@@ -269,6 +309,16 @@ func (h *AssetHandler) ListAssetForSale(c *gin.Context) {
 }
 
 // TransferAsset handles asset transfers
+// @Summary Transfer asset ownership
+// @Description Transfer asset tokens from one address to another
+// @Tags marketplace
+// @Accept json
+// @Produce json
+// @Param transfer body object true "Transfer details"
+// @Success 200 {object} models.Transaction
+// @Failure 400 {object} map[string]interface{}
+// @Failure 500 {object} map[string]interface{}
+// @Router /marketplace/transfer [post]
 func (h *AssetHandler) TransferAsset(c *gin.Context) {
 	var req struct {
 		AssetID     uint   `json:"asset_id" binding:"required"`

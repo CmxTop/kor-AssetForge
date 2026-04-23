@@ -37,6 +37,16 @@ type StellarEvent struct {
 }
 
 // HandleStellarEvent processes events received from Stellar Horizon
+// @Summary Handle Stellar events
+// @Description Webhook endpoint for receiving and processing events from the Stellar network
+// @Tags webhooks
+// @Accept json
+// @Produce json
+// @Param X-Stellar-Signature header string false "HMAC signature for verification"
+// @Param event body StellarEvent true "Stellar event payload"
+// @Success 200 {object} map[string]interface{}
+// @Failure 401 {object} map[string]interface{}
+// @Router /webhooks/stellar-events [post]
 func (h *WebhookHandler) HandleStellarEvent(c *gin.Context) {
 	// 1. Verify Signature
 	signature := c.GetHeader("X-Stellar-Signature")
